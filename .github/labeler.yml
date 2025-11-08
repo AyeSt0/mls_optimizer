@@ -1,0 +1,3 @@
+src: [ "src/**" ]
+docs: [ "docs/**", "**/*.md" ]
+ci: [ ".github/workflows/**" ]

@@ -1,0 +1,26 @@
+
+# Copy this file to settings.local.yaml and fill your secrets or overrides
+provider: deepseek
+model: deepseek-ai/DeepSeek-V3.2-Exp
+temperature: 0.2
+target_lang: zh-CN
+
+providers:
+  deepseek:
+    api_key: "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+    base_url: "https://api.siliconflow.cn/v1"
+  openai:
+    api_key: "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+    base_url: ""
+    organization: ""
+    extra_headers: {}
+
+rate_limit:
+  deepseek:
+    rpm: 60
+  openai:
+    rpm: 60
+
+# Optional: override the system prompt template here
+# system_template: |
+#   (paste your custom template)

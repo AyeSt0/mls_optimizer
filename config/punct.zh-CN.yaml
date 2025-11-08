@@ -1,0 +1,6 @@
+
+replace:
+  '"': '”'
+  "'": "’"
+  " - ": " — "
+normalize_ellipsis_to: "……"

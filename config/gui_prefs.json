@@ -1,0 +1,14 @@
+{
+  "excel": "D:\\Projects\\mls_optimizer\\data\\MLS Chinese.xlsx",
+  "glossary": "D:\\Projects\\mls_optimizer\\data\\name_map.json",
+  "outdir": "D:\\Projects\\mls_optimizer\\artifacts",
+  "provider": "deepseek",
+  "target_lang": "zh-CN",
+  "ui_lang": "zh",
+  "recent_excels": [
+    "D:\\Projects\\mls_optimizer\\data\\MLS Chinese.xlsx"
+  ],
+  "recent_gloss": [
+    "D:\\Projects\\mls_optimizer\\data\\name_map.json"
+  ]
+}
