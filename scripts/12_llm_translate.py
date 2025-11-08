@@ -1,379 +1,335 @@
 
-from pathlib import Path
-import os, sys, re, json, time, math, threading, queue, argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+import os, sys, time, json, math, argparse, threading, fnmatch
+from typing import Optional, Dict, Any, List, Set
 import pandas as pd
-
-try:
-    import yaml
-except Exception:
-    yaml = None
 
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None
+    OpenAI = None  # type: ignore
 
-def load_settings(p: Path) -> dict:
-    if not p.exists():
-        return {}
-    text = p.read_text("utf-8")
+def build_argparser():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--excel", required=True, help="Input Excel file")
+    ap.add_argument("--sheet-index", type=int, default=0, help="Sheet index (default 0)")
+    ap.add_argument("--sheet-name", type=str, default=None, help="Sheet name (override index)")
+    ap.add_argument("--target-lang", type=str, default="zh-CN", help="Target language code")
+
+    ap.add_argument("--settings", type=str, default="config/settings.local.yaml", help="Settings YAML path")
+    ap.add_argument("--provider", type=str, choices=["deepseek","openai"], default=None, help="Provider override")
+    ap.add_argument("--glossary", type=str, default=None, help="Glossary name_map.json")
+
+    ap.add_argument("--autosave-every", type=int, default=200, help="Autosave every N rows")
+    ap.add_argument("--autosave-seconds", type=int, default=120, help="Autosave every N seconds")
+    ap.add_argument("--checkpoint-file", type=str, default="artifacts/ckpt.translate.jsonl", help="Checkpoint jsonl path")
+    ap.add_argument("--wal-file", type=str, default=None, help="Write-ahead log jsonl")
+    ap.add_argument("--wal-every", type=int, default=10, help="WAL every N rows")
+
+    ap.add_argument("--show-lines", action="store_true", help="Print RU/EN/OUT grouped lines")
+    ap.add_argument("--max-chars", type=int, default=160, help="Max characters hint")
+
+    ap.add_argument("--rpm", type=int, default=60, help="Rate limit: requests per minute")
+    ap.add_argument("--tpm-max", type=int, default=100000, help="Token limit per minute (hint only)")
+
+    # advanced/compat flags
+    ap.add_argument("--workers", type=int, default=8, help="Parallel workers (placeholder)")
+    ap.add_argument("--min-workers", type=int, default=2, help="Min workers (placeholder)")
+    ap.add_argument("--max-workers", type=int, default=32, help="Max workers (placeholder)")
+    ap.add_argument("--rpm-min", type=int, default=30, help="Min rpm (placeholder)")
+    ap.add_argument("--rpm-max", type=int, default=1000, help="Max rpm (placeholder)")
+    ap.add_argument("--auto-tune", action="store_true", help="Auto tune (placeholder)")
+    ap.add_argument("--resume", action="store_true", help="Resume (placeholder)")
+
+    # selective rerun controls
+    ap.add_argument("--overwrite", action="store_true", help="Retranslate even if column 5 already has text")
+    ap.add_argument("--row-range", type=str, default=None, help="Only rows in range start:end (0-based, end exclusive)")
+    ap.add_argument("--speakers", type=str, default=None, help="Comma separated speaker filters, supports wildcard, e.g. student_*,teacher_*")
+    ap.add_argument("--scene-range", type=str, default=None, help="Only scenes a:b (0-based indices). requires artifacts/scenes.json")
+    ap.add_argument("--dry-run", action="store_true", help="Show planned rows count then exit")
+
+    ap.add_argument("--out", type:str, default=None, help="Output Excel path")
+    return ap
+
+def load_yaml(path: str) -> Dict[str, Any]:
     try:
-        return json.loads(text)
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
     except Exception:
-        if yaml:
+        return {}
+
+def resolve_provider(args, cfg):
+    prov = args.provider or cfg.get("provider") or "deepseek"
+    model_cfg = cfg.get("model") or cfg.get("llm") or {}
+    if "deepseek" not in model_cfg and "llm" in cfg and "deepseek" in cfg["llm"]:
+        model_cfg["deepseek"] = cfg["llm"]["deepseek"]
+    if "openai" not in model_cfg and "llm" in cfg and "openai" in cfg["llm"]:
+        model_cfg["openai"] = cfg["llm"]["openai"]
+    return prov, model_cfg
+
+class LLM:
+    def __init__(self, provider: str, model_cfg: Dict[str, Any]):
+        self.provider = provider
+        self.client = None
+        self.model = None
+        self.base_url = None
+        self.ok = False
+        sec = (model_cfg.get(provider) or {})
+        self.api_key = sec.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        self.base_url = sec.get("base_url") or os.getenv("OPENAI_BASE_URL") or None
+        self.model = sec.get("name") or sec.get("model") or "gpt-4o-mini"
+        if OpenAI is not None and self.api_key:
             try:
-                return yaml.safe_load(text) or {}
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url) if self.base_url else OpenAI(api_key=self.api_key)
+                self.ok = True
             except Exception:
-                return {}
-        return {}
+                self.client = None
+                self.ok = False
 
-def get_cfg_value(cfg: dict, path: str, default=None):
-    cur = cfg
-    for part in path.split("."):
-        if not isinstance(cur, dict): return default
-        cur = cur.get(part)
-    return default if cur is None else cur
+    def translate(self, ru: str, en: str, speaker: str, target: str, glossary: Dict[str,str], max_chars: int) -> str:
+        sys_prompt = (
+            "You are an expert adult visual-novel localizer. Translate and LOCALIZE into fluent {lang} for a college-set adult VN in 'Sunville'. "
+            "Honor speaker role for tone (teacher/principal/coach/ladies/system). "
+            "Keep placeholders intact ([mcname], [mcsurname], {{var}}, <tags>). "
+            "Do NOT translate brand names (Patreon, Instagram, Lovense), keep UI tech terms consistent. "
+            "For campus location strings by 'string' speaker, translate as real in-campus places (e.g., 化学教室/实验室, 生物教室, 更衣室, 礼堂, 学院入口). "
+            "Keep erotic details explicit but tasteful; dialogues must be natural spoken Chinese; avoid checklist style. "
+            "Prefer longest-phrase matches from glossary. College = 学院."
+        ).format(lang=target)
 
-def load_excel(path: str, sheet):
-    try:
-        if sheet is None or sheet == "":
-            return pd.read_excel(path)
-        try:
-            si = int(sheet)
-            return pd.read_excel(path, sheet_name=si)
-        except Exception:
-            return pd.read_excel(path, sheet_name=sheet)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read Excel: {e}")
+        user_payload = {
+            "speaker": speaker,
+            "ru": ru or "",
+            "en": en or "",
+            "glossary": glossary,
+            "rules": [
+                "Keep placeholders exactly as-is.",
+                "Do not translate brand names.",
+                "Dialogue colloquial and seductive; system strings concise."
+            ]
+        }
 
-def ensure_col5(df: pd.DataFrame) -> pd.DataFrame:
-    if df.shape[1] < 5:
-        for _ in range(5 - df.shape[1]):
-            df[df.shape[1]] = ""
-    return df
+        content = json.dumps(user_payload, ensure_ascii=False)
+        if self.ok and self.client is not None:
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role":"system","content":sys_prompt},
+                        {"role":"user","content":content}
+                    ],
+                    temperature=0.2,
+                )
+                txt = (resp.choices[0].message.content or "").strip()
+                return txt
+            except Exception:
+                pass
+        return (en or ru or "").strip()
 
-def detect_empty_rows(df: pd.DataFrame) -> list:
-    col = df.columns[4]
-    empty_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
-    return list(df.index[empty_mask])
-
-def load_glossary(glossary_path: str, glossary_max: int|None=None) -> dict:
-    if not glossary_path or not os.path.exists(glossary_path):
-        return {}
-    try:
-        g = json.loads(Path(glossary_path).read_text("utf-8"))
-    except Exception:
-        return {}
-    flat = {}
-    def walk(d):
-        if isinstance(d, dict):
-            for k,v in d.items():
-                if isinstance(v, (str,int,float)):
-                    flat[str(k)] = str(v)
-                elif isinstance(v, dict):
-                    walk(v)
-                elif isinstance(v, list):
-                    if len(v) >= 6 and isinstance(v[5], str):
-                        flat[str(k)] = v[5]
-    walk(g)
-    items = sorted(flat.items(), key=lambda kv: len(kv[0]), reverse=True)
-    if glossary_max and glossary_max > 0:
-        items = items[:glossary_max]
-    return dict(items)
-
-def build_domain_rules():
-    return {
-        "BIOLOGY": "生物教室",
-        "CHEMISTRY": "化学教室",
-        "GEOGRAPHY": "地理教室",
-        "COMPUTER CLASS": "计算机教室",
-        "GYM": "体育馆",
-        "LOCKER ROOMS": "更衣室",
-        "LOCKER": "储物柜间",
-        "ASSEMBLY HALL": "礼堂",
-        "DOCTOR'S OFFICE": "医务室",
-        "STEWARD'S OFFICE": "教务处",
-        "COLLEGE ENTRANCE": "学院大门"
-    }
-
-def build_prehint_for_scene(glossary: dict, speaker: str|None) -> str:
-    keep_raw = ["Patreon","Instagram","Lovense","OnlyFans","Twitter","Discord"]
-    placeholders_examples = ["[mcname]","[mcsurname]","mcname","{{var}}","<tag>"]
-    s_rules = []
-    if speaker and speaker.lower() == "string":
-        room_like = build_domain_rules()
-        s_rules.append("当文本是学院内的设施/课程/房间名称时，用“X 教室/办公室/体育馆/更衣室/储物柜间/医务室/礼堂/学院大门”等自然中文表达，而不是单个学科名。")
-        s_rules.append("如果是城镇地点名称，翻译为自然的中文地名风格，但保留专有名固有名的辨识度。")
-        for en, zh in room_like.items():
-            s_rules.append(f"{en} → {zh}")
-    s_rules.append("保留品牌/平台名原文不译：" + "、".join(keep_raw))
-    s_rules.append("占位符/变量/标签必须原样保留，例如：" + "、".join(placeholders_examples))
-    terms_lines = [f"{src} → {tgt}" for src, tgt in glossary.items()]
-    pre = "术语与风格提示（仅供生成参考，不改原文）\n" + "\n".join(s_rules[:12])
-    if terms_lines:
-        pre += "\n\n优先级：最长匹配优先；以下术语必须一致（仅供参考）：\n" + "\n".join(terms_lines[:200])
-    return pre
-
-def make_prompt(target_lang: str, prehint: str, speaker: str|None, ru: str, en: str, ctx: str) -> str:
-    role = "你是一名资深成人视觉小说本地化写手（College 场景，全部角色均为成年）。"
-    tone = "中文要自然、口语化但不低级，保持露骨细节（不审查、不错译）。"
-    addr = "若为对话，遵循中文对话语序与语气；若为系统/地点字符串（string speaker），按地点/设施自然表达。"
-    keep = "保留所有占位符/变量/标签（如 [mcname]、[mcsurname]、mcname、{{var}}、<tag>）原样不动；品牌名原文保留。"
-    names = "人名/地名若术语表已有固定译名，严格使用；否则保持与上下文一致，不强行音译。"
-    style = "避免清单式/指令式直译；把短句合并为自然短语或句群；不要加入解释。"
-    output = "只输出最终译文，不要引号、不加任何说明。"
-    speaker_hint = f"当前说话者：{speaker or 'unknown'}。"
-    ctx_snip = f"【上下文】\n{ctx}" if ctx else ""
-    en_ru = f"【英文参考】\n{en}\n【俄文参考】\n{ru}"
-    pre = f"【术语/风格提示】\n{prehint}" if prehint else ""
-    return "\n".join([role, tone, addr, keep, names, style, speaker_hint, pre, ctx_snip, en_ru, "【输出语言】"+target_lang, output]).strip()
-
-def openai_client_from_settings(cfg: dict, provider: str):
-    if OpenAI is None:
-        raise RuntimeError("openai package missing. pip install openai")
-    if provider == "deepseek":
-        api_key = get_cfg_value(cfg, "llm.deepseek.api_key", os.getenv("DEEPSEEK_API_KEY") or os.getenv("SILICONFLOW_API_KEY"))
-        base_url = get_cfg_value(cfg, "llm.deepseek.base_url", os.getenv("DEEPSEEK_BASE_URL") or os.getenv("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn/v1")
-        model = get_cfg_value(cfg, "llm.deepseek.name", "deepseek-ai/DeepSeek-V3.2-Exp")
-        if not api_key: raise RuntimeError("Missing DeepSeek/SiliconFlow API key")
-        cli = OpenAI(api_key=api_key, base_url=base_url)
-        return cli, model
-    else:
-        api_key = get_cfg_value(cfg, "llm.openai.api_key", os.getenv("OPENAI_API_KEY"))
-        base_url = get_cfg_value(cfg, "llm.openai.base_url", os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1")
-        model = get_cfg_value(cfg, "llm.openai.name", "gpt-4o-mini")
-        if not api_key: raise RuntimeError("Missing OPENAI_API_KEY")
-        cli = OpenAI(api_key=api_key, base_url=base_url)
-        return cli, model
-
-def scenes_from_file() -> dict:
-    p = Path("artifacts/scenes.json")
-    if not p.exists(): return {}
-    try:
-        return json.loads(p.read_text("utf-8"))
-    except Exception:
-        return {}
-
-def context_for_row(scenes: dict, idx: int, df: pd.DataFrame, max_chars: int) -> str:
-    if scenes and "scenes" in scenes:
-        for sc in scenes["scenes"]:
-            if idx in sc.get("rows", []):
-                rows = sc.get("rows", [])
-                try:
-                    pos = rows.index(idx)
-                except ValueError:
-                    break
-                win = rows[max(0,pos-3): pos+4]
-                chunks = []
-                for r in win:
-                    orig = str(df.iloc[r,0]) if r < len(df) else ""
-                    eng = str(df.iloc[r,2]) if r < len(df.columns) else ""
-                    if orig or eng:
-                        chunks.append(f"RU:{orig} / EN:{eng}")
-                s = "\n".join(chunks)
-                return s[-max_chars:]
-    start = max(0, idx-3); end = min(len(df), idx+4)
-    pieces = []
-    for r in range(start, end):
-        orig = str(df.iloc[r,0])
-        eng = str(df.iloc[r,2]) if df.shape[1] > 2 else ""
-        if orig or eng:
-            pieces.append(f"RU:{orig} / EN:{eng}")
-    s = "\n".join(pieces)
-    return s[-max_chars:]
-
-class RPMController:
-    def __init__(self, rpm_init=400, rpm_min=60, rpm_max=1000, auto=True):
+class RateLimiter:
+    def __init__(self, rpm: int):
         self.lock = threading.Lock()
-        self.rpm = rpm_init
-        self.rpm_min = rpm_min
-        self.rpm_max = rpm_max
-        self.auto = auto
+        self.min_interval = 60.0 / max(1, rpm)
         self.last = 0.0
-
-    def before_send(self):
+    def wait(self):
         with self.lock:
             now = time.time()
-            if self.rpm <= 0: return
-            interval = 60.0 / self.rpm
-            if self.last == 0.0:
-                self.last = now
-                return
-            delta = now - self.last
-            if delta < interval:
-                time.sleep(interval - delta)
+            dt = now - self.last
+            if dt < self.min_interval:
+                time.sleep(self.min_interval - dt)
             self.last = time.time()
 
-    def after_ok(self):
-        pass
-
-    def after_error(self, e: Exception):
-        if not self.auto: return
-        msg = str(e)
-        if "429" in msg or "rate" in msg.lower():
-            with self.lock:
-                self.rpm = max(self.rpm_min, int(self.rpm * 0.7))
-
-def call_llm(cli, model, prompt, rpm_controller):
-    rpm_controller.before_send()
+def is_blank_cell(v) -> bool:
+    if v is None: return True
     try:
-        rsp = cli.chat.completions.create(
-            model=model,
-            messages=[
-                {"role":"system","content":"You are a professional adult VN localization writer."},
-                {"role":"user","content":prompt}
-            ],
-            temperature=0.6
-        )
-        txt = rsp.choices[0].message.content.strip()
-        rpm_controller.after_ok()
-        return txt
+        if isinstance(v, float) and math.isnan(v): return True
+    except Exception:
+        pass
+    s = str(v).strip()
+    if s == "": return True
+    if s.lower() in {"nan","none","null"}: return True
+    return False
+
+def parse_row_range(rr: Optional[str], n: int) -> Optional[Set[int]]:
+    if not rr: return None
+    try:
+        a, b = rr.split(":")
+        a = int(a) if a else 0
+        b = int(b) if b else n
+        a = max(0, a); b = min(n, b)
+        return set(range(a, b))
+    except Exception:
+        return None
+
+def parse_speakers(sp: Optional[str]) -> Optional[List[str]]:
+    if not sp: return None
+    parts = [x.strip() for x in sp.split(",") if x.strip()]
+    return parts or None
+
+def load_scenes_rows(scene_range: Optional[str]) -> Optional[Set[int]]:
+    if not scene_range: return None
+    try:
+        a, b = scene_range.split(":")
+        a = int(a) if a else 0
+        b = int(b) if b else 1<<30
+    except Exception:
+        return None
+    path = "artifacts/scenes.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            scenes = json.load(f)
+        rows: Set[int] = set()
+        for i, sc in enumerate(scenes):
+            if i < a or i >= b: continue
+            r = sc.get("rows") or sc.get("line_ids") or []
+            for rid in r:
+                try:
+                    rows.add(int(rid))
+                except Exception:
+                    pass
+        return rows
+    except Exception:
+        return None
+
+def write_excel(df: pd.DataFrame, path: str):
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        df.to_excel(path, index=False)
     except Exception as e:
-        rpm_controller.after_error(e)
-        raise
+        print(f"[WARN] snapshot save failed: {e}", flush=True)
+
+def make_out_path(excel: str, lang: str) -> str:
+    base = os.path.splitext(os.path.basename(excel))[0]
+    d = os.path.dirname(os.path.abspath(excel))
+    return os.path.join(d, f"{base}.{lang}.llm.xlsx")
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--excel", required=True)
-    ap.add_argument("--sheet", default="0")
-    ap.add_argument("--target-lang", default="zh-CN")
-    ap.add_argument("--settings", default="config/settings.local.yaml")
-    ap.add_argument("--provider", default=None)
-    ap.add_argument("--glossary", default=None)
-    ap.add_argument("--glossary-max", type=int, default=200)
-    ap.add_argument("--context-mode", default="scene", choices=["scene","nearby","none"])
-    ap.add_argument("--autosave-every", type=int, default=300)
-    ap.add_argument("--autosave-seconds", type=int, default=90)
-    ap.add_argument("--checkpoint-file", default="artifacts/ckpt.translate.jsonl")
-    ap.add_argument("--wal-file", default="artifacts/translate.wal.jsonl")
-    ap.add_argument("--wal-every", type=int, default=10)
-    ap.add_argument("--show-lines", action="store_true")
-    ap.add_argument("--max-chars", type=int, default=160)
-    ap.add_argument("--rpm", type=int, default=400)
-    ap.add_argument("--rpm-min", type=int, default=60)
-    ap.add_argument("--rpm-max", type=int, default=1000)
-    ap.add_argument("--tpm-max", type=int, default=100000)
-    ap.add_argument("--workers", type=int, default=16)
-    ap.add_argument("--min-workers", type=int, default=4)
-    ap.add_argument("--max-workers", type=int, default=32)
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--est-input-ratio", type=float, default=3.2)
-    ap.add_argument("--est-output-tokens", type=int, default=220)
-    ap.add_argument("--auto-tune", action="store_true")
-    ap.add_argument("--out", default=None)
-    args = ap.parse_args()
+    args = build_argparser().parse_args()
+    cfg = load_yaml(args.settings)
+    prov, model_cfg = resolve_provider(args, cfg)
+    print(f"[CFG] provider={prov} rpm_init={args.rpm} tpm_max={args.tpm_max} workers={args.workers} min/max={args.min_workers}/{args.max_workers}", flush=True)
 
-    df = load_excel(args.excel, args.sheet)
-    df = ensure_col5(df)
-
-    needs = detect_empty_rows(df)
-    total = len(df)
-    to_do = len(needs)
-    print(f"[CFG] provider={(args.provider or 'auto')} rpm_init={args.rpm} tpm_max={args.tpm_max} context_mode={args.context_mode} workers={args.workers} min/max={args.min_workers}/{args.max_workers}")
-    print(f"[PLAN] total={total}, empty(col5)={to_do}, to_translate={to_do}")
-
-    if to_do == 0:
-        outp = args.out or (str(Path(args.excel).with_suffix(f".{args.target_lang}.llm.xlsx")))
-        df.to_excel(outp, index=False)
-        print(f"[OK] Done. Output -> {outp}")
-        return
-
-    cfg = load_settings(Path(args.settings))
-    provider = args.provider or cfg.get("provider") or "deepseek"
-    client, model = openai_client_from_settings(cfg, provider)
-
-    scenes = scenes_from_file()
-    glossary = load_glossary(args.glossary, args.glossary_max)
-    rpmc = RPMController(args.rpm, args.rpm_min, args.rpm_max, auto=args.auto_tune)
-
-    outp = args.out or (str(Path(args.excel).with_suffix(f".{args.target_lang}.llm.xlsx")))
-    ckpt = Path(args.checkpoint_file)
-    wal = Path(args.wal_file)
-    wal.parent.mkdir(parents=True, exist_ok=True)
-
-    if args.resume and Path(outp).exists():
+    # load glossary
+    glossary: Dict[str,str] = {}
+    if args.glossary and os.path.exists(args.glossary):
         try:
-            df_existing = pd.read_excel(outp)
-            if df_existing.shape[1] >= 5:
-                df.iloc[:,4] = df_existing.iloc[:,4]
-                needs = detect_empty_rows(df)
-                to_do = len(needs)
-                print(f"[INFO] resume: loaded previous output, remaining={to_do}")
+            with open(args.glossary, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                glossary = {str(k):str(v) for k,v in data.items() if isinstance(v,(str,int,float))}
         except Exception:
-            pass
+            glossary = {}
 
-    q_idx = queue.Queue()
-    for i in needs:
-        q_idx.put(i)
-    lock_write = threading.Lock()
+    # read excel
+    sheet = args.sheet_name if args.sheet_name else args.sheet_index
+    df = pd.read_excel(args.excel, sheet_name=sheet)
+    while df.shape[1] < 5:
+        df[df.shape[1]] = ""
+    COL_RU, COL_SPK, COL_EN, COL_CN_CURR, COL_OUT = 0, 1, 2, 3, 4
 
-    stats = {"done":0,"ok":0,"err":0}
-    t_last_save = time.time()
-    wal_buf = []
+    n = len(df)
+    # base mask: empty or overwrite (robust NaN/None handling)
+    if args.overwrite:
+        base_mask = pd.Series([True]*n)
+    else:
+        base_mask = df.iloc[:, COL_OUT].apply(is_blank_cell)
 
-    initial_workers = max(args.min_workers, min(args.workers, args.max_workers))
-    executor = ThreadPoolExecutor(max_workers=initial_workers)
-    futures = []
+    # row-range filter
+    rowset = parse_row_range(args.row_range, n)
+    if rowset is not None:
+        mask_rr = pd.Series([False]*n)
+        for i in rowset:
+            if 0 <= i < n: mask_rr.iat[i] = True
+        base_mask = base_mask & mask_rr
 
-    def worker_loop():
-        nonlocal t_last_save, wal_buf
-        while True:
-            try:
-                i = q_idx.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                ru = str(df.iloc[i,0]) if df.shape[1] > 0 else ""
-                speaker = str(df.iloc[i,1]) if df.shape[1] > 1 else ""
-                en = str(df.iloc[i,2]) if df.shape[1] > 2 else ""
-                prehint = build_prehint_for_scene(glossary, speaker)
-                ctx = ""
-                if args.context_mode != "none":
-                    ctx = context_for_row(scenes, i, df, args.max_chars)
-                prompt = make_prompt(args.target_lang, prehint, speaker, ru, en, ctx)
-                if args.show_lines:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] RU: {ru}")
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] EN: {en}")
-                out = call_llm(client, model, prompt, rpmc)
-                if args.show_lines:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] OUT: {out}")
-                with lock_write:
-                    df.iat[i,4] = out
-                wal_buf.append({"i":i,"out":out})
-                stats["ok"] += 1
-            except Exception as e:
-                stats["err"] += 1
-                print(f"[WARN] row={i} failed: {e}")
-            finally:
-                stats["done"] += 1
-                now = time.time()
-                if (stats["done"] % max(1,args.autosave_every) == 0) or (now - t_last_save >= args.autosave_seconds):
-                    with lock_write:
-                        if wal_buf:
-                            with wal.open("a", encoding="utf-8") as wf:
-                                for rec in wal_buf:
-                                    wf.write(json.dumps(rec, ensure_ascii=False) + "\\n")
-                            wal_buf.clear()
-                        df.to_excel(outp, index=False)
-                    print(f"[OK] autosave -> {outp}")
-                    t_last_save = now
-            q_idx.task_done()
+    # speaker filter
+    sp_filters = parse_speakers(args.speakers)
+    if sp_filters:
+        mask_sp = pd.Series([False]*n)
+        col = df.iloc[:, COL_SPK].astype(str).fillna("")
+        for i, v in enumerate(col):
+            if any(fnmatch.fnmatch(v, pat) for pat in sp_filters):
+                mask_sp.iat[i] = True
+        base_mask = base_mask & mask_sp
 
-    for _ in range(initial_workers):
-        futures.append(executor.submit(worker_loop))
+    # scene-range filter
+    sc_rows = load_scenes_rows(args.scene_range)
+    if sc_rows is not None:
+        mask_sc = pd.Series([False]*n)
+        for i in sc_rows:
+            if 0 <= i < n: mask_sc.iat[i] = True
+        base_mask = base_mask & mask_sc
 
-    print(f"[INFO] running with {initial_workers} workers (fixed in this build).")
+    todo_idx = list(df.index[base_mask])
+    total = int(df.shape[0])
+    to_translate = int(base_mask.sum())
+    print(f"[PLAN] total={total} to_translate={to_translate}", flush=True)
 
-    for f in as_completed(futures):
-        pass
+    if args.dry_run:
+        print("[DRYRUN] nothing executed.", flush=True)
+        return 0
 
-    with open(wal, "a", encoding="utf-8") as wf:
-        for rec in wal_buf:
-            wf.write(json.dumps(rec, ensure_ascii=False) + "\\n")
-    df.to_excel(outp, index=False)
-    print(f"[OK] Done. Output -> {outp}")
+    if to_translate == 0:
+        out_path = args.out or make_out_path(args.excel, args.target_lang)
+        write_excel(df, out_path)
+        print(f"[OK] Done. Output -> {os.path.abspath(out_path)}", flush=True)
+        return 0
+
+    llm = LLM(prov, model_cfg)
+    rl = RateLimiter(rpm=args.rpm)
+
+    out_path = args.out or make_out_path(args.excel, args.target_lang)
+    autosave_every = max(1, args.autosave_every)
+    autosave_seconds = max(15, args.autosave_seconds)
+    last_snap = time.time()
+
+    wal_fd = None
+    if args.wal_file:
+        os.makedirs(os.path.dirname(os.path.abspath(args.wal_file)), exist_ok=True)
+        wal_fd = open(args.wal_file, "a", encoding="utf-8")
+        wal_every = max(1, args.wal_every)
+    else:
+        wal_every = 1<<30  # never
+
+    done = 0
+    for i, idx in enumerate(todo_idx, 1):
+        ru = str(df.iat[idx, COL_RU]) if not pd.isna(df.iat[idx, COL_RU]) else ""
+        en = str(df.iat[idx, COL_EN]) if not pd.isna(df.iat[idx, COL_EN]) else ""
+        sp = str(df.iat[idx, COL_SPK]) if not pd.isna(df.iat[idx, COL_SPK]) else "string"
+
+        rl.wait()
+        out = llm.translate(ru=ru, en=en, speaker=sp, target=args.target_lang, glossary=glossary, max_chars=args.max_chars)
+        df.iat[idx, COL_OUT] = out
+
+        if args.show_lines:
+            sys.stdout.write(f"RU: {ru}\nEN: {en}\nOUT: {out}\n")
+            sys.stdout.flush()
+
+        done += 1
+        q = to_translate - done
+        pct = (done / max(1, to_translate)) * 100.0
+        print(f"[PROGRESS] q={q} ({pct:.1f}%)", flush=True)
+
+        if wal_fd and (i % wal_every == 0):
+            wal_fd.write(json.dumps({"row": int(idx), "out": out}, ensure_ascii=False) + "\n")
+            wal_fd.flush()
+
+        tnow = time.time()
+        if (i % autosave_every == 0) or (tnow - last_snap >= autosave_seconds):
+            write_excel(df, out_path)
+            print(f"[SNAPSHOT] Output -> {os.path.abspath(out_path)}", flush=True)
+            last_snap = tnow
+
+    write_excel(df, out_path)
+    if wal_fd: wal_fd.close()
+    print(f"[OK] Done. Output -> {os.path.abspath(out_path)}", flush=True)
+    return 0
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except SystemExit as e:
+        raise
+    except Exception as e:
+        print(f"[ERROR] {e}", flush=True)
+        sys.exit(1)

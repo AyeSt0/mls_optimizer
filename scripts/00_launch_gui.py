@@ -1,636 +1,446 @@
 ﻿
+import os
+import sys
+import json
+import queue
+import threading
+import subprocess
+import time
+import re
 from pathlib import Path
-import os, sys, json, re, subprocess, threading, time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_ROOT = Path(__file__).resolve().parent.parent
-CFG_DIR  = APP_ROOT / "config"
-ART_DIR  = APP_ROOT / "artifacts"
-DATA_DIR = APP_ROOT / "data"
-RECENT_FILE = ART_DIR / "ui_recent.json"
-SETTINGS_FILE = CFG_DIR / "settings.local.yaml"
-
-I18N = {
-    "zh": {
-        "app_title": "MLS 翻译助手 · GUI",
-        "file": "文件",
-        "recent": "最近打开",
-        "recent_excel": "最近 Excel",
-        "recent_glossary": "最近 术语表",
-        "config": "配置",
-        "provider": "API 提供商设置",
-        "view": "视图",
-        "log_level": "日志级别",
-        "help": "帮助",
-        "open_readme": "打开 README",
-        "open_issues": "打开 Issues",
-        "excel": "Excel 文件",
-        "glossary": "术语表 JSON",
-        "browse": "浏览",
-        "target_lang": "目标语言",
-        "provider_lbl": "默认提供商",
-        "run": "运行流水线",
-        "stop": "停止",
-        "open_artifacts": "打开 artifacts",
-        "open_output": "打开输出",
-        "log": "日志",
-        "preview": "预览/说明",
-        "advanced": "显示高级选项",
-        "save": "保存",
-        "cancel": "取消",
-        "provider_title": "编辑 API 配置",
-        "provider_type": "提供商",
-        "api_key": "API Key",
-        "base_url": "Base URL",
-        "model": "模型名",
-        "ok": "确定",
-        "level_all": "全部",
-        "level_info": "信息",
-        "level_warn": "警告",
-        "level_err": "错误",
-        "seg_first": "（自动）步骤1：场景切分",
-        "trans_second": "（自动）步骤2：大模型翻译",
-        "select_excel": "选择 Excel 文件",
-        "select_glossary": "选择术语表 JSON",
-        "restart_needed": "部分修改需重启运行生效。",
-        "lang_toggle": "EN/中文",
-        "adv_title": "高级选项",
-        "workers": "并发数",
-        "rpm": "RPM",
-        "tpm": "TPM 上限",
-        "flag_show": "显示逐行日志（--show-lines）",
-        "flag_resume": "断点续传（--resume）",
-    },
-    "en": {
-        "app_title": "MLS Translator · GUI",
-        "file": "File",
-        "recent": "Recent",
-        "recent_excel": "Recent Excels",
-        "recent_glossary": "Recent Glossaries",
-        "config": "Config",
-        "provider": "Provider Settings",
-        "view": "View",
-        "log_level": "Log Level",
-        "help": "Help",
-        "open_readme": "Open README",
-        "open_issues": "Open Issues",
-        "excel": "Excel",
-        "glossary": "Glossary JSON",
-        "browse": "Browse",
-        "target_lang": "Target language",
-        "provider_lbl": "Default Provider",
-        "run": "Run",
-        "stop": "Stop",
-        "open_artifacts": "Open artifacts",
-        "open_output": "Open output",
-        "log": "Log",
-        "preview": "Preview/Notes",
-        "advanced": "Show advanced options",
-        "save": "Save",
-        "cancel": "Cancel",
-        "provider_title": "Edit API Settings",
-        "provider_type": "Provider",
-        "api_key": "API Key",
-        "base_url": "Base URL",
-        "model": "Model",
-        "ok": "OK",
-        "level_all": "ALL",
-        "level_info": "INFO",
-        "level_warn": "WARN",
-        "level_err": "ERROR",
-        "seg_first": "(Auto) Step 1: Scene segmentation",
-        "trans_second": "(Auto) Step 2: LLM translation",
-        "select_excel": "Select Excel",
-        "select_glossary": "Select Glossary JSON",
-        "restart_needed": "Some changes may need restart to take effect.",
-        "lang_toggle": "EN/中文",
-        "adv_title": "Advanced",
-        "workers": "workers",
-        "rpm": "rpm",
-        "tpm": "tpm-max",
-        "flag_show": "Show lines (--show-lines)",
-        "flag_resume": "Resume (--resume)",
-    }
-}
+APP_TITLE = "MLS Optimizer - Pipeline GUI"
+DEFAULT_EXCEL = "data/MLS Chinese.xlsx"
+DEFAULT_GLOSSARY = "data/name_map.json"
+PYTHON_EXE = sys.executable or "python"
 
 LANG_CHOICES = [
-    ("Chinese (Simplified) 简体中文", "zh-CN"),
-    ("Chinese (Traditional) 繁體中文", "zh-TW"),
-    ("English 英语", "en"),
-    ("Japanese 日本語", "ja"),
-    ("Korean 한국어", "ko"),
-    ("Russian Русский", "ru"),
-    ("Spanish Español", "es"),
-    ("German Deutsch", "de"),
-    ("French Français", "fr"),
-    ("Italian Italiano", "it"),
-    ("Portuguese (Brazil) Português (BR)", "pt-BR"),
-    ("Portuguese (Portugal) Português (EU)", "pt-PT"),
-    ("Thai ไทย", "th"),
-    ("Vietnamese Tiếng Việt", "vi"),
+    "zh-CN","zh-TW","en","ja","ko","fr","de","es","ru","pt-BR","it","tr","vi","th","id",
+    "ar","he","hi","pl","uk","cs","ro","hu","el","nl","sv","fi","no","da"
 ]
 
-def read_text(path: Path) -> str:
-    try:
-        return path.read_text("utf-8")
-    except Exception:
-        return ""
-
-def write_text(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-def load_recent() -> dict:
-    if RECENT_FILE.exists():
-        try:
-            return json.loads(read_text(RECENT_FILE)) or {}
-        except Exception:
-            return {}
-    return {}
-
-def save_recent(d: dict):
-    try:
-        write_text(RECENT_FILE, json.dumps(d, ensure_ascii=False, indent=2))
-    except Exception:
-        pass
-
-def open_folder(p: Path):
-    try:
-        if os.name == "nt":
-            os.startfile(p)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", p])
-        else:
-            subprocess.Popen(["xdg-open", p])
-    except Exception as e:
-        messagebox.showerror("Error", str(e))
+def which(path):
+    return str(Path(path))
 
 class ProcRunner:
-    def __init__(self, log_cb, done_cb):
-        self._proc = None
+    """Run a sequence of commands, streaming stdout to a callback (append-only)."""
+    def __init__(self, log_cb, on_line_cb=None, on_done=None):
+        self._log_cb = log_cb
+        self._on_line_cb = on_line_cb
+        self._on_done = on_done
         self._thr = None
-        self.log_cb = log_cb
-        self.done_cb = done_cb
+        self._proc = None
+        self._stop_flag = threading.Event()
 
-    def run(self, cmd, cwd):
-        def _work():
-            try:
-                p = subprocess.Popen(
-                    cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, universal_newlines=True
-                )
-                self._proc = p
-                for line in p.stdout:
-                    self.log_cb(line.rstrip("\n"))
-                rc = p.wait()
-                self.done_cb(rc)
-            except Exception as e:
-                self.log_cb(f"[ERROR] {e}")
-                self.done_cb(1)
-        self._thr = threading.Thread(target=_work, daemon=True)
-        self._thr.start()
+    def running(self):
+        return (self._thr is not None) and self._thr.is_alive()
 
     def stop(self):
-        if self._proc and self._proc.poll() is None:
+        self._stop_flag.set()
+        p = self._proc
+        if p and (p.poll() is None):
             try:
-                self._proc.terminate()
+                p.terminate()
             except Exception:
                 pass
+
+    def run(self, commands):
+        if self.running():
+            return False
+        self._stop_flag.clear()
+        self._thr = threading.Thread(target=self._worker, args=(commands,), daemon=True)
+        self._thr.start()
+        return True
+
+    def _worker(self, commands):
+        rc_final = 0
+        for (title, cmd, cwd) in commands:
+            if self._stop_flag.is_set():
+                break
+            self._log_cb(f"[INFO] == {title} ==\n")
+            self._log_cb(which(" ".join(cmd)) + "\n")
+
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
+            except Exception as e:
+                self._log_cb(f"[ERROR] spawn failed: {e}\n")
+                rc_final = 1
+                break
+
+            for line in self._proc.stdout:
+                if self._stop_flag.is_set():
+                    break
+                self._log_cb(line)
+                if self._on_line_cb:
+                    self._on_line_cb(line)
+
+            self._proc.wait()
+            rc = self._proc.returncode or 0
+            self._proc = None
+            if rc != 0:
+                self._log_cb(f"[ERROR] step failed: rc={rc}\n")
+                rc_final = rc
+                break
+            else:
+                self._log_cb("[OK] Step finished.\n")
+
+        if self._on_done:
+            self._on_done(rc_final)
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.lang = "zh"
-        self.recent = load_recent()
-        self.last_output = None
-        self.proc = None
+        root.title(APP_TITLE)
+        root.geometry("1040x720")
+        root.minsize(900, 600)
 
-        self.root.title(I18N[self.lang]["app_title"])
-        self.root.geometry("1080x740")
-        self.root.minsize(900, 620)
-        for i in range(3):
-            self.root.grid_columnconfigure(i, weight=1)
-        self.root.grid_rowconfigure(3, weight=1)
+        self.excel_var = tk.StringVar(value=DEFAULT_EXCEL)
+        self.glossary_var = tk.StringVar(value=DEFAULT_GLOSSARY)
+        self.sheet_idx_var = tk.IntVar(value=0)
+        self.lang_var = tk.StringVar(value="zh-CN")
 
-        # state vars (persist across rebuilds)
-        self.var_excel = tk.StringVar(value=str((DATA_DIR/"MLS Chinese.xlsx").resolve()))
-        self.var_gloss = tk.StringVar(value=str((DATA_DIR/"name_map.json").resolve()))
-        self.var_lang  = tk.StringVar(value="zh-CN")
-        self.var_provider = tk.StringVar(value="deepseek")
-        self.var_adv = tk.BooleanVar(value=True)
-        self.var_workers = tk.StringVar(value="16")
-        self.var_rpm = tk.StringVar(value="400")
-        self.var_tpm = tk.StringVar(value="100000")
-        self.var_show = tk.BooleanVar(value=False)
-        self.var_resume = tk.BooleanVar(value=True)
-        self.log_level = tk.StringVar(value="ALL")
+        self.overwrite_var = tk.BooleanVar(value=False)
+        self.row_range_var = tk.StringVar(value="")
+        self.speakers_var = tk.StringVar(value="")
+        self.scene_range_var = tk.StringVar(value="")
+        self.dry_run_var = tk.BooleanVar(value=False)
 
-        # build full UI
-        self._build_all()
+        # post steps
+        self.do_terms_var = tk.BooleanVar(value=True)   # 术语统一
+        self.do_style_var = tk.BooleanVar(value=True)   # 风格适配
+        self.do_qa_var = tk.BooleanVar(value=True)      # QA
 
-    # ---------- builders ----------
-    def _build_all(self):
-        for w in self.root.grid_slaves():
-            w.destroy()
-        self._build_menubar()
-        self._build_toolbar()
-        self._build_tabs()
-        self._init_log_tags()
-        self._place_lang_button()
+        self.progress_total = 0
+        self.progress_pct = 0.0
+        self.last_output_path = None
 
-    def _build_menubar(self):
-        self.menubar = tk.Menu(self.root)
-        self.root.config(menu=self.menubar)
+        self._build_menu()
+        self._build_body()
 
-        t = I18N[self.lang]
+        self.runner = ProcRunner(log_cb=self.append_log, on_line_cb=self._parse_line, on_done=self._on_done)
+        self._tick()
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
         # File
-        self.file_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label=t["file"], menu=self.file_menu)
-        self.recent_excel_menu = tk.Menu(self.file_menu, tearoff=0)
-        self.recent_gloss_menu = tk.Menu(self.file_menu, tearoff=0)
-        self.file_menu.add_cascade(label=t["recent_excel"], menu=self.recent_excel_menu)
-        self.file_menu.add_cascade(label=t["recent_glossary"], menu=self.recent_gloss_menu)
-        self.file_menu.add_separator()
-        self.file_menu.add_command(label=t["open_artifacts"], command=lambda: open_folder(ART_DIR))
-        self._refresh_recent_menus()
-
-        # Config
-        self.cfg_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label=t["config"], menu=self.cfg_menu)
-        self.cfg_menu.add_command(label=t["provider"], command=self._open_provider_dialog)
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="选择 Excel…", command=self.pick_excel)
+        m_file.add_command(label="选择 术语表…", command=self.pick_glossary)
+        m_file.add_separator()
+        m_file.add_command(label="打开输出文件", command=self.open_output)
+        m_file.add_separator()
+        m_file.add_command(label="退出", command=self.root.quit)
+        menubar.add_cascade(label="文件", menu=m_file)
 
         # View
-        self.view_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label=t["view"], menu=self.view_menu)
-        self.view_menu.add_radiobutton(label=t["level_all"], variable=self.log_level, value="ALL", command=self._apply_log_filter)
-        self.view_menu.add_radiobutton(label=t["level_info"], variable=self.log_level, value="INFO", command=self._apply_log_filter)
-        self.view_menu.add_radiobutton(label=t["level_warn"], variable=self.log_level, value="WARN", command=self._apply_log_filter)
-        self.view_menu.add_radiobutton(label=t["level_err"], variable=self.log_level, value="ERROR", command=self._apply_log_filter)
+        m_view = tk.Menu(menubar, tearoff=0)
+        self.show_time = tk.BooleanVar(value=True)
+        m_view.add_checkbutton(label="日志显示时间戳", onvalue=True, offvalue=False, variable=self.show_time)
+        menubar.add_cascade(label="视图", menu=m_view)
 
         # Help
-        self.help_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label=t["help"], menu=self.help_menu)
-        self.help_menu.add_command(label=t["open_readme"], command=self._open_readme)
-        self.help_menu.add_command(label=t["open_issues"], command=self._open_issues)
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="README（打开）", command=self.open_readme)
+        menubar.add_cascade(label="帮助", menu=m_help)
 
-        # language toggle hotkey
-        self.root.bind("<F12>", lambda e: self._toggle_lang())
+        self.root.config(menu=menubar)
 
-    def _build_toolbar(self):
-        t = I18N[self.lang]
-        frm = ttk.Frame(self.root)
-        frm.grid(row=0, column=0, columnspan=3, sticky="ew", padx=8, pady=6)
-        for i in range(10):
-            frm.grid_columnconfigure(i, weight=1)
+    def _build_body(self):
+        # Top form
+        frm_top = ttk.Frame(self.root, padding=8)
+        frm_top.pack(side="top", fill="x")
 
-        ttk.Label(frm, text=t["excel"]).grid(row=0, column=0, sticky="w")
-        e1 = ttk.Entry(frm, textvariable=self.var_excel)
-        e1.grid(row=0, column=1, columnspan=6, sticky="ew", padx=4)
-        ttk.Button(frm, text=t["browse"], command=self._pick_excel).grid(row=0, column=7, sticky="ew")
+        # Row 1: Excel + Glossary + Sheet
+        row1 = ttk.Frame(frm_top)
+        row1.pack(side="top", fill="x", pady=2)
+        ttk.Label(row1, text="Excel:").pack(side="left")
+        ttk.Entry(row1, textvariable=self.excel_var, width=60).pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Button(row1, text="浏览…", command=self.pick_excel).pack(side="left", padx=4)
+        ttk.Label(row1, text="术语表:").pack(side="left", padx=(12, 0))
+        ttk.Entry(row1, textvariable=self.glossary_var, width=30).pack(side="left", padx=4)
+        ttk.Button(row1, text="浏览…", command=self.pick_glossary).pack(side="left", padx=4)
+        ttk.Label(row1, text="Sheet:").pack(side="left", padx=(12, 0))
+        spn = ttk.Spinbox(row1, from_=0, to=999, textvariable=self.sheet_idx_var, width=4)
+        spn.pack(side="left")
 
-        ttk.Label(frm, text=t["glossary"]).grid(row=1, column=0, sticky="w")
-        e2 = ttk.Entry(frm, textvariable=self.var_gloss)
-        e2.grid(row=1, column=1, columnspan=6, sticky="ew", padx=4)
-        ttk.Button(frm, text=t["browse"], command=self._pick_glossary).grid(row=1, column=7, sticky="ew")
+        # Row 2: Target language + overwrite
+        row2 = ttk.Frame(frm_top)
+        row2.pack(side="top", fill="x", pady=2)
+        ttk.Label(row2, text="目标语言:").pack(side="left")
+        self.cb_lang = ttk.Combobox(row2, textvariable=self.lang_var, values=LANG_CHOICES, width=12, state="readonly")
+        self.cb_lang.pack(side="left", padx=4)
+        ttk.Checkbutton(row2, text="覆盖已有译文（重译）", variable=self.overwrite_var).pack(side="left", padx=12)
 
-        ttk.Label(frm, text=t["target_lang"]).grid(row=0, column=8, sticky="e")
-        self.combo_lang = ttk.Combobox(frm, state="readonly",
-                                       values=[f"{name} | {code}" for name,code in LANG_CHOICES])
-        self.combo_lang.grid(row=0, column=9, sticky="ew")
-        # set & bind
+        # Row 3: filters
+        row3 = ttk.Frame(frm_top)
+        row3.pack(side="top", fill="x", pady=2)
+        ttk.Label(row3, text="行号范围 start:end").pack(side="left")
+        ttk.Entry(row3, textvariable=self.row_range_var, width=12).pack(side="left", padx=4)
+        ttk.Label(row3, text="Speaker 过滤（* 支持）").pack(side="left", padx=(12,0))
+        ttk.Entry(row3, textvariable=self.speakers_var, width=18).pack(side="left", padx=4)
+        ttk.Label(row3, text="场景范围 a:b").pack(side="left", padx=(12,0))
+        ttk.Entry(row3, textvariable=self.scene_range_var, width=10).pack(side="left", padx=4)
+        ttk.Checkbutton(row3, text="仅预览（Dry run）", variable=self.dry_run_var).pack(side="left", padx=12)
+
+        # Row 4: pipeline post steps
+        row4 = ttk.Frame(frm_top)
+        row4.pack(side="top", fill="x", pady=(6,2))
+        ttk.Label(row4, text="后处理：").pack(side="left")
+        ttk.Checkbutton(row4, text="术语统一", variable=self.do_terms_var).pack(side="left", padx=6)
+        ttk.Checkbutton(row4, text="风格适配", variable=self.do_style_var).pack(side="left", padx=6)
+        ttk.Checkbutton(row4, text="QA 检查", variable=self.do_qa_var).pack(side="left", padx=6)
+
+        # Row 5: buttons
+        row5 = ttk.Frame(frm_top)
+        row5.pack(side="top", fill="x", pady=(6,4))
+        self.btn_run = ttk.Button(row5, text="一键运行", command=self.on_run)
+        self.btn_run.pack(side="left")
+        ttk.Button(row5, text="仅预览", command=self.on_dry_run).pack(side="left", padx=8)
+        self.btn_stop = ttk.Button(row5, text="停止", command=self.on_stop, state=tk.DISABLED)
+        self.btn_stop.pack(side="left", padx=8)
+        self.btn_open = ttk.Button(row5, text="打开输出", command=self.open_output, state=tk.DISABLED)
+        self.btn_open.pack(side="left", padx=8)
+
+        # Progress
+        row6 = ttk.Frame(frm_top)
+        row6.pack(side="top", fill="x", pady=(6,4))
+        self.prog = ttk.Progressbar(row6, orient="horizontal", mode="determinate", length=300, maximum=1000)
+        self.prog.pack(side="left")
+        self.lbl_prog = ttk.Label(row6, text="等待中…")
+        self.lbl_prog.pack(side="left", padx=8)
+
+        # Log area (append-only, with scrollbar)
+        frm_log = ttk.Frame(self.root, padding=4)
+        frm_log.pack(side="top", fill="both", expand=True)
+        self.txt = tk.Text(frm_log, wrap="word", height=20, background="#111", foreground="#ddd", insertbackground="#fff")
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(frm_log, orient="vertical", command=self.txt.yview)
+        sb.pack(side="right", fill="y")
+        self.txt.configure(yscrollcommand=sb.set)
+
+        # color tags
+        self.txt.tag_configure("INFO", foreground="#a0d8ff")
+        self.txt.tag_configure("WARN", foreground="#ffd479")
+        self.txt.tag_configure("ERROR", foreground="#ff8080")
+        self.txt.tag_configure("OK", foreground="#8fff8f")
+        self.txt.tag_configure("PATH", foreground="#a8ffa8")
+        self.txt.tag_configure("H1", foreground="#fff", font=("Consolas", 10, "bold"))
+
+    # ============ Menu handlers =============
+    def pick_excel(self):
+        p = filedialog.askopenfilename(title="选择 Excel 文件", filetypes=[("Excel", "*.xlsx;*.xls")])
+        if p:
+            self.excel_var.set(p)
+
+    def pick_glossary(self):
+        p = filedialog.askopenfilename(title="选择 术语表 JSON", filetypes=[("JSON", "*.json")])
+        if p:
+            self.glossary_var.set(p)
+
+    def open_output(self):
+        if not self.last_output_path:
+            messagebox.showinfo("提示", "还没有输出文件。")
+            return
         try:
-            label = next(lbl for lbl, code in LANG_CHOICES if code == self.var_lang.get())
-        except StopIteration:
-            label = LANG_CHOICES[0][0]
-            self.var_lang.set(LANG_CHOICES[0][1])
-        self.combo_lang.set(f"{label} | {self.var_lang.get()}")
-        self.combo_lang.bind("<<ComboboxSelected>>", lambda e: self.var_lang.set(self.combo_lang.get().split("|")[-1].strip()))
-
-        ttk.Label(frm, text=t["provider_lbl"]).grid(row=1, column=8, sticky="e")
-        self.combo_provider = ttk.Combobox(frm, state="readonly", values=["deepseek","openai"])
-        self.combo_provider.grid(row=1, column=9, sticky="ew")
-        self.combo_provider.set(self.var_provider.get())
-        self.combo_provider.bind("<<ComboboxSelected>>", lambda e: self.var_provider.set(self.combo_provider.get()))
-
-        bar = ttk.Frame(self.root)
-        bar.grid(row=1, column=0, columnspan=3, sticky="ew", padx=8)
-        for i in range(6):
-            bar.grid_columnconfigure(i, weight=1)
-
-        self.btn_run = ttk.Button(bar, text=t["run"], command=self._run_pipeline)
-        self.btn_stop = ttk.Button(bar, text=t["stop"], command=self._stop_pipeline, state=tk.DISABLED)
-        self.btn_art = ttk.Button(bar, text=t["open_artifacts"], command=lambda: open_folder(ART_DIR))
-        self.btn_open = ttk.Button(bar, text=t["open_output"], command=self._open_output, state=tk.DISABLED)
-
-        self.btn_run.grid(row=0, column=0, sticky="w", padx=2, pady=4)
-        self.btn_stop.grid(row=0, column=1, sticky="w", padx=2, pady=4)
-        self.btn_art.grid(row=0, column=2, sticky="w", padx=2, pady=4)
-        self.btn_open.grid(row=0, column=3, sticky="w", padx=2, pady=4)
-
-        self.chk_adv = ttk.Checkbutton(bar, text=t["advanced"],
-                                       variable=self.var_adv, command=self._toggle_advanced)
-        self.chk_adv.grid(row=0, column=5, sticky="e", padx=2)
-
-        # progress
-        self.pbar = ttk.Progressbar(bar, mode="indeterminate")
-        self.pbar.grid(row=0, column=4, sticky="ew", padx=4, pady=4)
-
-        # Advanced pane
-        self.adv = ttk.Labelframe(self.root, text=t["adv_title"])
-        self.adv.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
-        for i in range(8):
-            self.adv.grid_columnconfigure(i, weight=1)
-
-        ttk.Label(self.adv, text=t["workers"]).grid(row=0, column=0, sticky="e")
-        ttk.Entry(self.adv, textvariable=self.var_workers, width=8).grid(row=0, column=1, sticky="w")
-        ttk.Label(self.adv, text=t["rpm"]).grid(row=0, column=2, sticky="e")
-        ttk.Entry(self.adv, textvariable=self.var_rpm, width=8).grid(row=0, column=3, sticky="w")
-        ttk.Label(self.adv, text=t["tpm"]).grid(row=0, column=4, sticky="e")
-        ttk.Entry(self.adv, textvariable=self.var_tpm, width=10).grid(row=0, column=5, sticky="w")
-        ttk.Checkbutton(self.adv, text=t["flag_show"], variable=self.var_show).grid(row=0, column=6, sticky="w")
-        ttk.Checkbutton(self.adv, text=t["flag_resume"], variable=self.var_resume).grid(row=0, column=7, sticky="w")
-
-        if not self.var_adv.get():
-            self.adv.grid_remove()
-
-    def _build_tabs(self):
-        t = I18N[self.lang]
-        self.nb = ttk.Notebook(self.root)
-        self.nb.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=8, pady=(0,8))
-        self.root.grid_rowconfigure(3, weight=1)
-
-        self.tab_log = ttk.Frame(self.nb)
-        self.nb.add(self.tab_log, text=t["log"])
-
-        self.txt = tk.Text(self.tab_log, wrap="word", bg="#111", fg="#ddd", insertbackground="#fff")
-        self.txt.pack(fill="both", expand=True)
-        self.txt.configure(state="disabled")
-
-        self.tab_prev = ttk.Frame(self.nb)
-        self.nb.add(self.tab_prev, text=t["preview"])
-
-        prev_label = tk.Text(self.tab_prev, height=10, wrap="word", bg="#181818", fg="#d4d4d4", insertbackground="#fff")
-        prev_label.pack(fill="both", expand=True, padx=8, pady=8)
-        prev_label.insert("end",
-            "· 本工具会自动执行：\n"
-            "  1) 场景切分  2) 大模型翻译（仅翻译第5列空单元格）\n"
-            "· 术语表采用最长匹配优先\n"
-            "· string speaker 的校内地点会按“教室/办公室/礼堂”等自然表达\n"
-            "· 占位符/品牌名原样保留\n"
-        )
-        prev_label.configure(state="disabled")
-
-    def _init_log_tags(self):
-        self.txt.tag_configure("OK", foreground="#16C60C")
-        self.txt.tag_configure("WARN", foreground="#CCA700")
-        self.txt.tag_configure("ERROR", foreground="#E74856")
-        self.txt.tag_configure("CFG", foreground="#11A8CD")
-        self.txt.tag_configure("BOLD", font=("Consolas", 10, "bold"))
-        self._apply_log_filter()
-
-    # ---------- helpers ----------
-    def _place_lang_button(self):
-        btn = getattr(self, "lang_btn", None)
-        if btn is None:
-            self.lang_btn = ttk.Button(self.root, text=I18N[self.lang]["lang_toggle"], command=self._toggle_lang)
-        else:
-            self.lang_btn.configure(text=I18N[self.lang]["lang_toggle"])
-        self.lang_btn.place(relx=1.0, rely=0.0, x=-120, y=2, anchor="ne", width=110, height=26)
-
-    def _add_recent(self, kind: str, path: str):
-        d = self.recent
-        arr = d.get(kind, [])
-        path = str(Path(path))
-        if path in arr:
-            arr.remove(path)
-        arr.insert(0, path)
-        d[kind] = arr[:10]
-        save_recent(d)
-        self._refresh_recent_menus()
-
-    def _refresh_recent_menus(self):
-        self.recent_excel_menu.delete(0, "end")
-        for p in self.recent.get("excel", []):
-            self.recent_excel_menu.add_command(label=p, command=lambda x=p: self.var_excel.set(x))
-        self.recent_gloss_menu.delete(0, "end")
-        for p in self.recent.get("glossary", []):
-            self.recent_gloss_menu.add_command(label=p, command=lambda x=p: self.var_gloss.set(x))
-
-    # ---------- dialogs ----------
-    def _open_provider_dialog(self):
-        t = I18N[self.lang]
-        win = tk.Toplevel(self.root)
-        win.title(t["provider_title"])
-        win.geometry("520x240")
-        win.transient(self.root)
-        win.grab_set()
-
-        provider = tk.StringVar(value=self.var_provider.get())
-        api_key  = tk.StringVar(value="")
-        base_url = tk.StringVar(value="")
-        model    = tk.StringVar(value="")
-
-        frm = ttk.Frame(win, padding=10)
-        frm.pack(fill="both", expand=True)
-
-        ttk.Label(frm, text=t["provider_type"]).grid(row=0, column=0, sticky="e")
-        cb = ttk.Combobox(frm, values=["deepseek","openai"], state="readonly", textvariable=provider)
-        cb.grid(row=0, column=1, sticky="w", padx=6)
-
-        ttk.Label(frm, text=t["api_key"]).grid(row=1, column=0, sticky="e")
-        ttk.Entry(frm, textvariable=api_key, show="*").grid(row=1, column=1, sticky="ew", padx=6)
-
-        ttk.Label(frm, text=t["base_url"]).grid(row=2, column=0, sticky="e")
-        ttk.Entry(frm, textvariable=base_url).grid(row=2, column=1, sticky="ew", padx=6)
-
-        ttk.Label(frm, text=t["model"]).grid(row=3, column=0, sticky="e")
-        ttk.Entry(frm, textvariable=model).grid(row=3, column=1, sticky="ew", padx=6)
-
-        frm.grid_columnconfigure(1, weight=1)
-
-        def save_cfg():
-            prov = provider.get()
-            self.var_provider.set(prov)
-            self.combo_provider.set(prov)
-            if prov == "deepseek":
-                text = (
-                    "provider: deepseek\n\n"
-                    "llm:\n"
-                    "  deepseek:\n"
-                    f"    api_key: \"{api_key.get()}\"\n"
-                    f"    base_url: \"{base_url.get() or 'https://api.siliconflow.cn/v1'}\"\n"
-                    f"    name: \"{model.get() or 'deepseek-ai/DeepSeek-V3.2-Exp'}\"\n"
-                    "  openai:\n"
-                    "    api_key: \"\"\n"
-                    "    base_url: \"https://api.openai.com/v1\"\n"
-                    "    name: \"gpt-4o-mini\"\n"
-                )
+            if sys.platform.startswith("win"):
+                os.startfile(self.last_output_path)  # type: ignore
             else:
-                text = (
-                    "provider: openai\n\n"
-                    "llm:\n"
-                    "  deepseek:\n"
-                    "    api_key: \"\"\n"
-                    "    base_url: \"https://api.siliconflow.cn/v1\"\n"
-                    "    name: \"deepseek-ai/DeepSeek-V3.2-Exp\"\n"
-                    "  openai:\n"
-                    f"    api_key: \"{api_key.get()}\"\n"
-                    f"    base_url: \"{base_url.get() or 'https://api.openai.com/v1'}\"\n"
-                    f"    name: \"{model.get() or 'gpt-4o-mini'}\"\n"
-                )
-            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_FILE.write_text(text, encoding="utf-8")
-            messagebox.showinfo("OK", I18N[self.lang]["restart_needed"])
-            win.destroy()
+                subprocess.Popen(["xdg-open", self.last_output_path])
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开：{e}")
 
-        btnf = ttk.Frame(win)
-        btnf.pack(fill="x", padx=10, pady=6)
-        ttk.Button(btnf, text=t["ok"], command=save_cfg).pack(side="right")
-
-    # ---------- actions ----------
-    def _pick_excel(self):
-        t = I18N[self.lang]
-        p = filedialog.askopenfilename(
-            title=t["select_excel"],
-            filetypes=[("Excel","*.xlsx *.xls"), ("All","*.*")],
-            initialdir=str(DATA_DIR)
-        )
-        if p:
-            self.var_excel.set(p)
-            self._add_recent("excel", p)
-
-    def _pick_glossary(self):
-        t = I18N[self.lang]
-        p = filedialog.askopenfilename(
-            title=t["select_glossary"],
-            filetypes=[("JSON","*.json"), ("All","*.*")],
-            initialdir=str(DATA_DIR)
-        )
-        if p:
-            self.var_gloss.set(p)
-            self._add_recent("glossary", p)
-
-    def _append_log(self, line: str):
-        lvl = self.log_level.get()
-        if lvl != "ALL":
-            if lvl == "INFO" and (("[WARN]" in line) or ("[ERROR]" in line)):
-                return
-            if lvl == "WARN" and ("[ERROR]" in line):
-                return
-            if lvl == "ERROR" and ("[ERROR]" not in line):
-                return
-
-        self.txt.configure(state="normal")
-        tag = None
-        if "[OK]" in line: tag = "OK"
-        elif "[WARN]" in line: tag = "WARN"
-        elif "[ERROR]" in line or "Traceback" in line: tag = "ERROR"
-        elif "[CFG]" in line: tag = "CFG"
-
-        self.txt.insert("end", line + "\n", tag)
-        for kw in ["RU:", "EN:", "OUT:", "Output ->"]:
-            idx = "1.0"
-            while True:
-                idx = self.txt.search(kw, idx, stopindex="end")
-                if not idx: break
-                self.txt.tag_add("BOLD", idx, f"{idx}+{len(kw)}c")
-                idx = f"{idx}+1c"
-        self.txt.see("end")
-        self.txt.configure(state="disabled")
-
-        m = re.search(r"Output\s*->\s*(.+)$", line)
-        if m:
-            self.last_output = m.group(1).strip()
-            self.btn_open.config(state=tk.NORMAL)
-
-    def _run_pipeline(self):
-        # reset log
-        self.txt.configure(state="normal"); self.txt.delete("1.0","end"); self.txt.configure(state="disabled")
-        self.btn_run.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        self.btn_open.config(state=tk.DISABLED)
-        self.pbar.start(10)
-
-        excel = self.var_excel.get().strip('"')
-        gloss = self.var_gloss.get().strip('"')
-        lang_code = self.var_lang.get() or "zh-CN"
-
-        cmd1 = [sys.executable, "-u", "-m", "scripts.05_segment_context", "--excel", excel]
-        cmd2 = [
-            sys.executable, "-u", "-m", "scripts.12_llm_translate",
-            "--excel", excel, "--target-lang", lang_code, "--glossary", gloss,
-            "--rpm", self.var_rpm.get(), "--tpm-max", self.var_tpm.get(),
-            "--workers", self.var_workers.get(), "--auto-tune"
-        ]
-        if self.var_resume.get():
-            cmd2.append("--resume")
-        if self.var_show.get():
-            cmd2.append("--show-lines")
-
-        def _run_all():
-            self._append_log("== Step 1/2 =="); self._append_log(" ".join(cmd1))
-            pr = ProcRunner(self._append_log, lambda rc: None); pr.run(cmd1, cwd=str(APP_ROOT))
-            while pr._thr.is_alive(): time.sleep(0.1)
-            self._append_log("== Step 2/2 =="); self._append_log(" ".join(cmd2))
-            self.proc = ProcRunner(self._append_log, self._on_done); self.proc.run(cmd2, cwd=str(APP_ROOT))
-
-        threading.Thread(target=_run_all, daemon=True).start()
-
-    def _stop_pipeline(self):
-        if self.proc:
-            self.proc.stop()
-        self.pbar.stop()
-        self.btn_run.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-
-    def _on_done(self, rc: int):
-        self.pbar.stop()
-        self.btn_run.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-        if rc == 0:
-            self._append_log("[OK] Step finished.")
-        else:
-            self._append_log("[ERROR] step failed: rc={}".format(rc))
-
-    def _open_output(self):
-        if self.last_output and Path(self.last_output).exists():
-            try:
-                os.startfile(self.last_output) if os.name == "nt" else subprocess.Popen(["open" if sys.platform=="darwin" else "xdg-open", self.last_output])
-            except Exception as e:
-                messagebox.showerror("Error", str(e))
-        else:
-            open_folder(DATA_DIR)
-
-    def _toggle_advanced(self):
-        if self.var_adv.get():
-            self.adv.grid()
-        else:
-            self.adv.grid_remove()
-
-    def _apply_log_filter(self):
-        # filtering happens on insert; here we could re-render if needed
-        pass
-
-    def _open_readme(self):
-        p = APP_ROOT / "README.md"
-        if p.exists():
-            os.startfile(p) if os.name == "nt" else subprocess.Popen(["open" if sys.platform=="darwin" else "xdg-open", p])
-        else:
-            messagebox.showinfo("README", "README.md not found.")
-
-    def _open_issues(self):
+    def open_readme(self):
+        p = Path("README.md")
+        if not p.exists():
+            messagebox.showinfo("提示", "项目根目录未找到 README.md")
+            return
         try:
-            import webbrowser
-            webbrowser.open("https://github.com/")
-        except Exception:
-            pass
+            if sys.platform.startswith("win"):
+                os.startfile(str(p))  # type: ignore
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开 README：{e}")
 
-    def _toggle_lang(self):
-        # keep current values; rebuild all widgets with new language
-        self.lang = "en" if self.lang == "zh" else "zh"
-        self.root.title(I18N[self.lang]["app_title"])
-        self._build_all()
+    # ============ Run logic =============
+    def on_run(self):
+        if self.runner.running():
+            return
+        excel = self.excel_var.get().strip()
+        glossary = self.glossary_var.get().strip()
+        if not excel:
+            messagebox.showwarning("提示", "请选择 Excel。")
+            return
+        if not Path(excel).exists():
+            messagebox.showwarning("提示", f"Excel 不存在：{excel}")
+            return
+        if glossary and (not Path(glossary).exists()):
+            messagebox.showwarning("提示", f"术语表不存在：{glossary}")
+            return
+
+        self.txt_mark_h1("开始运行流水线…\n")
+        self._set_running(True)
+        self.progress_total = 0
+        self.progress_pct = 0
+        self._update_progress(0.0, "准备中…")
+
+        cmds = []
+
+        # Step 1: segmentation
+        cmds.append(("Step 1/2", [
+            PYTHON_EXE, "-u", "-m", "scripts.05_segment_context",
+            "--excel", excel,
+            "--sheet-index", str(self.sheet_idx_var.get())
+        ], None))
+
+        # Step 2: translate
+        translate_cmd = [
+            PYTHON_EXE, "-u", "-m", "scripts.12_llm_translate",
+            "--excel", excel,
+            "--target-lang", self.lang_var.get()
+        ]
+        if glossary:
+            translate_cmd += ["--glossary", glossary]
+        if self.overwrite_var.get():
+            translate_cmd += ["--overwrite"]
+        if self.row_range_var.get().strip():
+            translate_cmd += ["--row-range", self.row_range_var.get().strip()]
+        if self.speakers_var.get().strip():
+            translate_cmd += ["--speakers", self.speakers_var.get().strip()]
+        if self.scene_range_var.get().strip():
+            translate_cmd += ["--scene-range", self.scene_range_var.get().strip()]
+
+        cmds.append(("Step 2/2", translate_cmd, None))
+
+        # post steps (optional)
+        # 顺序：术语统一 -> 风格适配 -> QA
+        if self.do_terms_var.get():
+            if Path("scripts/20_enforce_terms.py").exists():
+                cmds.append(("Post: Terms", [PYTHON_EXE, "-u", "-m", "scripts.20_enforce_terms",
+                                             "--excel", excel,
+                                             "--glossary", glossary], None))
+            else:
+                self.append_log("[WARN] 术语统一脚本缺失（scripts/20_enforce_terms.py），已跳过。\n")
+        if self.do_style_var.get():
+            if Path("scripts/30_style_adapt.py").exists():
+                cmds.append(("Post: Style", [PYTHON_EXE, "-u", "-m", "scripts.30_style_adapt",
+                                             "--excel", excel], None))
+            else:
+                self.append_log("[WARN] 风格适配脚本缺失（scripts/30_style_adapt.py），已跳过。\n")
+        if self.do_qa_var.get():
+            if Path("scripts/25_qa_check.py").exists():
+                cmds.append(("Post: QA", [PYTHON_EXE, "-u", "-m", "scripts.25_qa_check",
+                                          "--excel", excel], None))
+            else:
+                self.append_log("[WARN] QA 脚本缺失（scripts/25_qa_check.py），已跳过。\n")
+
+        self.runner.run(cmds)
+
+    def on_dry_run(self):
+        if self.runner.running():
+            return
+        excel = self.excel_var.get().strip()
+        glossary = self.glossary_var.get().strip()
+        if not excel:
+            messagebox.showwarning("提示", "请选择 Excel。")
+            return
+        if not Path(excel).exists():
+            messagebox.showwarning("提示", f"Excel 不存在：{excel}")
+            return
+
+        self.txt_mark_h1("Dry run…\n")
+        self._set_running(True)
+        self._update_progress(0.0, "准备中…")
+
+        translate_cmd = [
+            PYTHON_EXE, "-u", "-m", "scripts.12_llm_translate",
+            "--excel", excel,
+            "--target-lang", self.lang_var.get(),
+            "--dry-run"
+        ]
+        if glossary and Path(glossary).exists():
+            translate_cmd += ["--glossary", glossary]
+        if self.overwrite_var.get():
+            translate_cmd += ["--overwrite"]
+        if self.row_range_var.get().strip():
+            translate_cmd += ["--row-range", self.row_range_var.get().strip()]
+        if self.speakers_var.get().strip():
+            translate_cmd += ["--speakers", self.speakers_var.get().strip()]
+        if self.scene_range_var.get().strip():
+            translate_cmd += ["--scene-range", self.scene_range_var.get().strip()]
+
+        cmds = [("Dry Run", translate_cmd, None)]
+        self.runner.run(cmds)
+
+    def on_stop(self):
+        self.runner.stop()
+        self.append_log("[WARN] 请求停止…\n")
+
+    # ============ logging / progress =============
+    def append_log(self, text: str):
+        # do not clear, append-only
+        ts = time.strftime("[%H:%M:%S] ") if self.show_time.get() else ""
+        # class tags by prefix
+        tag = None
+        if text.startswith("[ERROR]"):
+            tag = "ERROR"
+        elif text.startswith("[WARN]"):
+            tag = "WARN"
+        elif text.startswith("[OK]"):
+            tag = "OK"
+        elif text.startswith("[INFO]"):
+            tag = "INFO"
+        else:
+            tag = None
+
+        self.txt.insert("end", ts + text, tag)
+        self.txt.see("end")
+
+        # detect output path
+        m = re.search(r"Output\s*->\s*(.+)$", text.strip())
+        if m:
+            outp = m.group(1).strip()
+            self.last_output_path = outp
+            self.btn_open.configure(state=tk.NORMAL)
+
+    def txt_mark_h1(self, text):
+        ts = time.strftime("[%H:%M:%S] ") if self.show_time.get() else ""
+        self.txt.insert("end", ts + text, "H1")
+        self.txt.see("end")
+
+    def _parse_line(self, line: str):
+        # progress from 12_llm_translate: "[PROGRESS] q=... (xx.x%)"
+        m = re.search(r"\(([0-9]+(?:\.[0-9]+)?)%\)", line)
+        if m:
+            pct = float(m.group(1))
+            self._update_progress(pct, f"翻译进度 {pct:.1f}%")
+        if "Scenes saved to" in line:
+            self._update_progress(0.0, "已完成场景切分…")
+
+    def _update_progress(self, pct: float, text: str):
+        pct = max(0.0, min(100.0, pct))
+        self.prog.configure(value=int(pct*10))
+        self.lbl_prog.configure(text=text)
+
+    def _on_done(self, rc):
+        if rc == 0:
+            self.append_log("[OK] 全部完成。\n")
+        else:
+            self.append_log(f"[ERROR] 结束，返回码 {rc}\n")
+        self._set_running(False)
+
+    def _set_running(self, running: bool):
+        self.btn_run.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.btn_stop.configure(state=tk.NORMAL if running else tk.DISABLED)
 
 def main():
     root = tk.Tk()

@@ -1,0 +1,77 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Auto Commit (Infer type/scope)",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        "scripts/auto_commit.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONIOENCODING": "utf-8",
+          "GIT_PAGER": "cat"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Auto Commit (Pick type/scope)",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "command": "python",
+      "args": [
+        "scripts/auto_commit.py",
+        "--type",
+        "${input:commitType}",
+        "--scope",
+        "${input:commitScope}"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Auto Commit + Tag (Infer)",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "command": "python",
+      "args": [
+        "scripts/auto_commit.py",
+        "--tag"
+      ],
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "commitType",
+      "type": "pickString",
+      "description": "Conventional Commit type",
+      "options": [
+        "feat",
+        "fix",
+        "docs",
+        "style",
+        "refactor",
+        "perf",
+        "test",
+        "build",
+        "ci",
+        "chore",
+        "revert"
+      ],
+      "default": "chore"
+    },
+    {
+      "id": "commitScope",
+      "type": "promptString",
+      "description": "Scope (e.g. src,docs,tests). Leave empty to auto-infer",
+      "default": ""
+    }
+  ]
+}
