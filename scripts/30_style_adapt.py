@@ -1,74 +1,76 @@
-
-import argparse, os, json
-from tqdm import tqdm
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+30_style_adapt.py — micro style adaptation + punctuation mapping
+- If speaker is 'string' and value looks like campus labels, map to Chinese place names.
+- Apply punctuation mapping after translation to col5.
+"""
+import argparse, json, re
+from pathlib import Path
 import pandas as pd
-from mls_optimizer.io_utils import load_excel, save_excel
-from mls_optimizer.config import OptimConfig
 
-# Very light style pass: punctuation map + small whitespace normalization
-def apply_style(s: str, punct_map: dict) -> str:
-    if not s: return s
-    out = s
-    for k, v in punct_map.items():
-        out = out.replace(k, v)
-    # collapse excessive spaces around Chinese punctuation
-    out = out.replace(" ，", "，").replace(" 。", "。").replace(" ！", "！").replace(" ？", "？")
-    return out
+CAMPUS_MAP = {
+    "BIOLOGY": "生物教室",
+    "CHEMISTRY": "化学教室",
+    "GEOGRAPHY": "地理教室",
+    "COMPUTER CLASS": "计算机教室",
+    "ASSEMBLY HALL": "礼堂",
+    "LOCKER": "储物柜",
+    "LOCKER ROOMS": "更衣室",
+    "GYM": "体育馆",
+    "DOCTOR'S OFFICE": "校医室",
+    "STEWARD'S OFFICE": "教务处办公室",
+    "COLLEGE ENTRANCE": "学院正门",
+}
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Style & punctuation pass with progress/resume/autosave")
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--excel", required=True)
-    ap.add_argument("--sheet", default=None)
+    ap.add_argument("--sheet", default="0")
+    ap.add_argument("--punct-map", default=None, help="JSON mapping file for punctuation")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--punct-map", required=True)
-    ap.add_argument("--target-lang", default="zh-CN")
-    ap.add_argument("--start-row", type=int, default=0)
-    ap.add_argument("--end-row", type=int, default=None)
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--checkpoint-file", default="artifacts/ckpt.style.jsonl")
-    ap.add_argument("--autosave-every", type=int, default=800)
     args = ap.parse_args()
 
-    os.makedirs("artifacts", exist_ok=True)
-    df = load_excel(args.excel, args.sheet)
-    cfg = OptimConfig()
-    out_col = df.columns[cfg.col_out]
+    df = pd.read_excel(args.excel, sheet_name=args.sheet)
+    while df.shape[1] < 5: df[f"col_{df.shape[1]}"] = ""
 
-    with open(args.punct_map, "r", encoding="utf-8") as f:
-        punct = json.load(f) if args.punct_map.lower().endswith(".json") else None
-        if punct is None:
-            # try yaml
-            try:
-                import yaml
-                punct = yaml.safe_load(f)
-            except Exception:
-                raise RuntimeError("punct-map must be JSON or YAML")
+    # load punct map
+    pmap = {}
+    if args.punct_map and Path(args.punct_map).exists():
+        try:
+            pmap = json.loads(Path(args.punct_map).read_text("utf-8"))
+        except Exception:
+            pmap = {}
+    # defaults
+    if not pmap:
+        pmap = { "...": "…", "....":"…", "—":"—", "--":"——", "!?":"？！", "?!":"？！" }
 
-    from mls_optimizer.checkpoint import Checkpointer
-    ckpt = Checkpointer(args.checkpoint_file)
+    for i in range(df.shape[0]):
+        speaker = str(df.iloc[i,1]).strip().lower()
+        en = str(df.iloc[i,2]).strip()
+        out = str(df.iloc[i,4])
+        if speaker == "string":
+            key = en.upper()
+            # try exact
+            if key in CAMPUS_MAP and out:
+                df.iat[i,4] = CAMPUS_MAP[key]
+                continue
+            # fuzzy contains
+            for k,v in CAMPUS_MAP.items():
+                if k in key and out:
+                    df.iat[i,4] = v
+                    break
+        # punctuation mapping
+        s = df.iat[i,4]
+        for k,v in pmap.items():
+            s = s.replace(k, v)
+        df.iat[i,4] = s
 
-    n = len(df)
-    end = args.end_row if args.end_row is not None else n
-    bar = tqdm(total=(end - args.start_row), desc="Style pass")
-    changed = 0
-    for i in range(args.start_row, end):
-        if args.resume and (i in ckpt.processed):
-            bar.update(1); continue
-        row = df.iloc[i]
-        zh = "" if pd.isna(row.iloc[cfg.col_out]) else str(row.iloc[cfg.col_out])
-        if not zh:
-            ckpt.mark(i, {"skip": "empty"}); bar.update(1); continue
-        new_zh = apply_style(zh, punct)
-        if new_zh != zh:
-            df.at[i, out_col] = new_zh
-            changed += 1
-        ckpt.mark(i, {"changed": bool(new_zh != zh)})
-        if i % max(1, args.autosave_every) == 0 and i != 0:
-            tmp = args.excel.replace(".xlsx", f".{args.target_lang}.styled.part.xlsx")
-            save_excel(df, tmp)
-        bar.update(1)
-    bar.close()
+    outp = Path(args.out) if args.out else Path(args.excel).with_suffix("").with_name(Path(args.excel).stem + ".styled.xlsx")
+    df.to_excel(outp, index=False)
+    print(f"[OK] Style adapted.")
+    print(f"Output -> {outp}")
+    return 0
 
-    out_path = args.out or (args.excel.replace(".xlsx", f".{args.target_lang}.styled.xlsx"))
-    save_excel(df, out_path)
-    print(f"[OK] Style pass changed={changed} -> {out_path}")
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,474 +1,379 @@
-﻿
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-12_llm_translate.py  (per-row autosave + persistent cache + WAL)
 
-- Reads Excel: col1 RU, col2 speaker, col3 EN, col4 CN(existing), writes col5 OUT
-- Only translate where col5 is empty (resume-friendly)
-- Per-row WAL append to --wal-file (JSONL), ALWAYS
-- Persistent cache (--cache-file JSONL) keyed by hash(ru|en|speaker|ctx|glossary_digest|target)
-- Longest-first glossary mapping
-- Optional immediate Excel write per row (autosave-every=1 or autosave-seconds=0)
-- Minimal dynamic throttling by rpm/tpm (best-effort)
-
-NOTE: This is a focused drop-in. It accepts a superset of args used in your GUI.
-"""
-
-import argparse
-import sys
-import json
-import os
-import time
-import math
-import re
-import queue
-import threading
 from pathlib import Path
+import os, sys, re, json, time, math, threading, queue, argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import hashlib
-
 import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
-# --- Settings helpers ------------------------------------------------------
+try:
+    import yaml
+except Exception:
+    yaml = None
 
-def _read_yaml_dict(p: Path):
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+def load_settings(p: Path) -> dict:
+    if not p.exists():
+        return {}
+    text = p.read_text("utf-8")
     try:
-        import yaml
+        return json.loads(text)
+    except Exception:
+        if yaml:
+            try:
+                return yaml.safe_load(text) or {}
+            except Exception:
+                return {}
+        return {}
+
+def get_cfg_value(cfg: dict, path: str, default=None):
+    cur = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict): return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
+def load_excel(path: str, sheet):
+    try:
+        if sheet is None or sheet == "":
+            return pd.read_excel(path)
+        try:
+            si = int(sheet)
+            return pd.read_excel(path, sheet_name=si)
+        except Exception:
+            return pd.read_excel(path, sheet_name=sheet)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read Excel: {e}")
+
+def ensure_col5(df: pd.DataFrame) -> pd.DataFrame:
+    if df.shape[1] < 5:
+        for _ in range(5 - df.shape[1]):
+            df[df.shape[1]] = ""
+    return df
+
+def detect_empty_rows(df: pd.DataFrame) -> list:
+    col = df.columns[4]
+    empty_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
+    return list(df.index[empty_mask])
+
+def load_glossary(glossary_path: str, glossary_max: int|None=None) -> dict:
+    if not glossary_path or not os.path.exists(glossary_path):
+        return {}
+    try:
+        g = json.loads(Path(glossary_path).read_text("utf-8"))
     except Exception:
         return {}
-    if not p.exists():
+    flat = {}
+    def walk(d):
+        if isinstance(d, dict):
+            for k,v in d.items():
+                if isinstance(v, (str,int,float)):
+                    flat[str(k)] = str(v)
+                elif isinstance(v, dict):
+                    walk(v)
+                elif isinstance(v, list):
+                    if len(v) >= 6 and isinstance(v[5], str):
+                        flat[str(k)] = v[5]
+    walk(g)
+    items = sorted(flat.items(), key=lambda kv: len(kv[0]), reverse=True)
+    if glossary_max and glossary_max > 0:
+        items = items[:glossary_max]
+    return dict(items)
+
+def build_domain_rules():
+    return {
+        "BIOLOGY": "生物教室",
+        "CHEMISTRY": "化学教室",
+        "GEOGRAPHY": "地理教室",
+        "COMPUTER CLASS": "计算机教室",
+        "GYM": "体育馆",
+        "LOCKER ROOMS": "更衣室",
+        "LOCKER": "储物柜间",
+        "ASSEMBLY HALL": "礼堂",
+        "DOCTOR'S OFFICE": "医务室",
+        "STEWARD'S OFFICE": "教务处",
+        "COLLEGE ENTRANCE": "学院大门"
+    }
+
+def build_prehint_for_scene(glossary: dict, speaker: str|None) -> str:
+    keep_raw = ["Patreon","Instagram","Lovense","OnlyFans","Twitter","Discord"]
+    placeholders_examples = ["[mcname]","[mcsurname]","mcname","{{var}}","<tag>"]
+    s_rules = []
+    if speaker and speaker.lower() == "string":
+        room_like = build_domain_rules()
+        s_rules.append("当文本是学院内的设施/课程/房间名称时，用“X 教室/办公室/体育馆/更衣室/储物柜间/医务室/礼堂/学院大门”等自然中文表达，而不是单个学科名。")
+        s_rules.append("如果是城镇地点名称，翻译为自然的中文地名风格，但保留专有名固有名的辨识度。")
+        for en, zh in room_like.items():
+            s_rules.append(f"{en} → {zh}")
+    s_rules.append("保留品牌/平台名原文不译：" + "、".join(keep_raw))
+    s_rules.append("占位符/变量/标签必须原样保留，例如：" + "、".join(placeholders_examples))
+    terms_lines = [f"{src} → {tgt}" for src, tgt in glossary.items()]
+    pre = "术语与风格提示（仅供生成参考，不改原文）\n" + "\n".join(s_rules[:12])
+    if terms_lines:
+        pre += "\n\n优先级：最长匹配优先；以下术语必须一致（仅供参考）：\n" + "\n".join(terms_lines[:200])
+    return pre
+
+def make_prompt(target_lang: str, prehint: str, speaker: str|None, ru: str, en: str, ctx: str) -> str:
+    role = "你是一名资深成人视觉小说本地化写手（College 场景，全部角色均为成年）。"
+    tone = "中文要自然、口语化但不低级，保持露骨细节（不审查、不错译）。"
+    addr = "若为对话，遵循中文对话语序与语气；若为系统/地点字符串（string speaker），按地点/设施自然表达。"
+    keep = "保留所有占位符/变量/标签（如 [mcname]、[mcsurname]、mcname、{{var}}、<tag>）原样不动；品牌名原文保留。"
+    names = "人名/地名若术语表已有固定译名，严格使用；否则保持与上下文一致，不强行音译。"
+    style = "避免清单式/指令式直译；把短句合并为自然短语或句群；不要加入解释。"
+    output = "只输出最终译文，不要引号、不加任何说明。"
+    speaker_hint = f"当前说话者：{speaker or 'unknown'}。"
+    ctx_snip = f"【上下文】\n{ctx}" if ctx else ""
+    en_ru = f"【英文参考】\n{en}\n【俄文参考】\n{ru}"
+    pre = f"【术语/风格提示】\n{prehint}" if prehint else ""
+    return "\n".join([role, tone, addr, keep, names, style, speaker_hint, pre, ctx_snip, en_ru, "【输出语言】"+target_lang, output]).strip()
+
+def openai_client_from_settings(cfg: dict, provider: str):
+    if OpenAI is None:
+        raise RuntimeError("openai package missing. pip install openai")
+    if provider == "deepseek":
+        api_key = get_cfg_value(cfg, "llm.deepseek.api_key", os.getenv("DEEPSEEK_API_KEY") or os.getenv("SILICONFLOW_API_KEY"))
+        base_url = get_cfg_value(cfg, "llm.deepseek.base_url", os.getenv("DEEPSEEK_BASE_URL") or os.getenv("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn/v1")
+        model = get_cfg_value(cfg, "llm.deepseek.name", "deepseek-ai/DeepSeek-V3.2-Exp")
+        if not api_key: raise RuntimeError("Missing DeepSeek/SiliconFlow API key")
+        cli = OpenAI(api_key=api_key, base_url=base_url)
+        return cli, model
+    else:
+        api_key = get_cfg_value(cfg, "llm.openai.api_key", os.getenv("OPENAI_API_KEY"))
+        base_url = get_cfg_value(cfg, "llm.openai.base_url", os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1")
+        model = get_cfg_value(cfg, "llm.openai.name", "gpt-4o-mini")
+        if not api_key: raise RuntimeError("Missing OPENAI_API_KEY")
+        cli = OpenAI(api_key=api_key, base_url=base_url)
+        return cli, model
+
+def scenes_from_file() -> dict:
+    p = Path("artifacts/scenes.json")
+    if not p.exists(): return {}
+    try:
+        return json.loads(p.read_text("utf-8"))
+    except Exception:
         return {}
-    with p.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
 
-def _settings():
-    base = Path("config")
-    local = base / "settings.local.yaml"
-    default = base / "settings.yaml"
-    s = {}
-    s.update(_read_yaml_dict(default))
-    s.update(_read_yaml_dict(local))
-    return s
-
-def _ensure_v1(url: str) -> str:
-    if url.endswith("/v1"):
-        return url
-    if url.endswith("/"):
-        return url + "v1"
-    return url + "/v1"
-
-# --- Glossary --------------------------------------------------------------
-
-def load_glossary(glossary_path: str):
-    if not glossary_path:
-        return [], "no-glossary"
-    p = Path(glossary_path)
-    if not p.exists():
-        return [], "no-glossary"
-    data = json.loads(p.read_text("utf-8"))
-    # data may be: {"Professor Richardson": "理查森教授", ...}
-    items = []
-    for k, v in data.items():
-        if not k or not v:
-            continue
-        items.append((k, v))
-    # longest-first by source length (desc)
-    items.sort(key=lambda kv: len(kv[0]), reverse=True)
-    digest = hashlib.sha1(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-    return items, digest
-
-def apply_glossary(s: str, gls_items):
-    if not s or not gls_items:
-        return s
-    # longest-first exact phrase replacement; respect word boundaries for latin tokens
-    out = s
-    for src, tgt in gls_items:
-        try:
-            # If purely ASCII token, do boundary-aware replace, else plain replace
-            if all(ord(ch) < 128 for ch in src):
-                pat = r'(?<![\w])' + re.escape(src) + r'(?![\w])'
-                out = re.sub(pat, tgt, out)
-            else:
-                out = out.replace(src, tgt)
-        except re.error:
-            out = out.replace(src, tgt)
-    return out
-
-# --- Cache (JSONL) ---------------------------------------------------------
-
-class JsonlCache:
-    def __init__(self, path: Path):
-        self.path = path
-        self.lock = threading.Lock()
-        self.map = {}  # key -> value
-        if path.exists():
-            for line in path.open("r", encoding="utf-8"):
-                if not line.strip():
-                    continue
+def context_for_row(scenes: dict, idx: int, df: pd.DataFrame, max_chars: int) -> str:
+    if scenes and "scenes" in scenes:
+        for sc in scenes["scenes"]:
+            if idx in sc.get("rows", []):
+                rows = sc.get("rows", [])
                 try:
-                    row = json.loads(line)
-                    self.map[row["key"]] = row["val"]
-                except Exception:
-                    continue
-
-    def get(self, key):
-        return self.map.get(key)
-
-    def put(self, key, val):
-        with self.lock:
-            self.map[key] = val
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({"key": key, "val": val}, ensure_ascii=False) + "\n")
-
-# --- WAL -------------------------------------------------------------------
-
-class Wal:
-    def __init__(self, path: Path):
-        self.path = path
-        self.lock = threading.Lock()
-
-    def append(self, rec: dict):
-        rec2 = dict(rec)
-        rec2["ts"] = datetime.utcnow().isoformat()
-        line = json.dumps(rec2, ensure_ascii=False)
-        with self.lock:
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-
-# --- Excel writer (single-thread) -----------------------------------------
-
-class ExcelWriterThread(threading.Thread):
-    def __init__(self, excel_path: Path, sheet_name=None, flush_every=1, flush_seconds=1.0):
-        super().__init__(daemon=True)
-        self.excel_path = excel_path
-        self.sheet_name = sheet_name
-        self.flush_every = max(1, int(flush_every))
-        self.flush_seconds = max(0.0, float(flush_seconds))
-        self.q = queue.Queue()
-        self._stop = threading.Event()
-        self._last_save = time.time()
-        self._pending = 0
-
-        self.wb = load_workbook(str(excel_path))
-        if sheet_name and sheet_name in self.wb.sheetnames:
-            self.ws = self.wb[sheet_name]
-        else:
-            self.ws = self.wb[self.wb.sheetnames[0]]
-
-    def run(self):
-        while not self._stop.is_set():
-            try:
-                item = self.q.get(timeout=0.2)
-            except queue.Empty:
-                item = None
-
-            if item:
-                row_idx, col_idx, val = item
-                try:
-                    self.ws.cell(row=row_idx, column=col_idx, value=val)
-                except Exception:
-                    pass
-                self._pending += 1
-
-            now = time.time()
-            if self._pending >= self.flush_every or (self.flush_seconds and (now - self._last_save) >= self.flush_seconds):
-                try:
-                    self.wb.save(str(self.excel_path))
-                    self._last_save = now
-                    self._pending = 0
-                except Exception:
-                    # ignore save errors, try next round
-                    pass
-
-        # Final save on stop
-        try:
-            self.wb.save(str(self.excel_path))
-        except Exception:
-            pass
-        try:
-            self.wb.close()
-        except Exception:
-            pass
-
-    def submit(self, row_idx, col_idx, val):
-        self.q.put((row_idx, col_idx, val))
-
-    def stop(self):
-        self._stop.set()
-
-# --- LLM client (OpenAI compatible) ----------------------------------------
-
-def build_client(provider: str, cfg: dict):
-    from openai import OpenAI
-
-    prov = (provider or "").lower()
-    llm_cfg = cfg.get("llm") or cfg.get("model") or {}
-    if prov in ("deepseek", "siliconflow"):
-        c = (llm_cfg.get("deepseek") or {})
-        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("SILICONFLOW_API_KEY") or c.get("api_key")
-        base = _ensure_v1((c.get("base_url") or "https://api.siliconflow.cn"))
-        model = c.get("name") or c.get("model") or "deepseek-ai/DeepSeek-V3.2-Exp"
-        if not api_key:
-            raise RuntimeError("Missing DeepSeek/SiliconFlow API key.")
-        client = OpenAI(api_key=api_key, base_url=base)
-        return client, model
-    # default openai
-    oc = (llm_cfg.get("openai") or {})
-    api_key = os.getenv("OPENAI_API_KEY") or oc.get("api_key")
-    base = _ensure_v1((oc.get("base_url") or "https://api.openai.com"))
-    model = oc.get("name") or oc.get("model") or "gpt-4o-mini"
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY.")
-    client = OpenAI(api_key=api_key, base_url=base)
-    return client, model
-
-# --- Prompt ----------------------------------------------------------------
-
-def make_prompt(target_lang_label: str, ru: str, en: str, speaker: str, scene_hint: str, glossary_items):
-    # High-signal instruction tuned for Sunshine Town college VN
-    sys_inst = (
-        "You are a senior localization writer for an adult college visual novel set in Sunshine Town. "
-        "All characters are 18+. Keep seductive, natural, immersive tone for Chinese players. "
-        "Use EN for literal meaning; use RU for mood/sensual nuance. "
-        "Keep placeholders exactly as-is: [mcname], [mcsurname], mcname, [var], {{tag}}, <tag>.\n"
-        "If speaker seems like a UI label or location list (often 'string'), prefer concise noun phrases; "
-        "for school locations, translate to 'X教室/办公室/更衣室/体育馆/医务室/礼堂/学院大门' etc.\n"
-        "For brand names (Patreon, Instagram, Lovense) keep original. Technical: Sync ID, Local IP, Port -> keep glossary mapping.\n"
-        "Never output quotes or explanations. Output ONLY the final Chinese. "
-        "Keep explicit erotic content as-is (no censorship). "
-    )
-    if glossary_items:
-        # add top-N glossary lines to bias the model
-        tips = "术语表（优先长词匹配）：\n" + "\n".join([f"- {k} -> {v}" for k,v in glossary_items[:50]])
-    else:
-        tips = ""
-
-    # style hints by speaker
-    style = ""
-    sp = (speaker or "").lower()
-    if sp in ("principal_richardson","principal_richardson_t","teacher","teacher_adams","teacher_clark","teacher_hill","teacher_morris","librarian_wilson"):
-        style = "语气：学术/权威，但自然口语。"
-    elif sp in ("trainer_brooks","coach","coach_brooks","trainer_brooks_t"):
-        style = "语气：运动指导口吻，直接有力。"
-    elif sp in ("mrs","lady","madam","madame","secretary_young","emilys_mother","emilys_mother_t"):
-        style = "语气：礼貌克制，但自然口语（不必强制使用‘您’）。"
-    elif sp == "string":
-        style = "语气：UI/地点短语，名词化，避免清单式断句。"
-    else:
-        style = "语气：自然、口语化、带情绪张力；对话不要清单式直译。"
-
-    user = f"""\
-[目标语言] {target_lang_label}
-
-[角色] speaker = {speaker}
-[场景提示] {scene_hint or "（连续剧情场景）"}
-
-[英文原文]
-{en or ""}
-
-[俄文原文]
-{ru or ""}
-
-[{style}]
-{tips}
-"""
-    return sys_inst, user
-
-# --- Rate / token helpers (best-effort) ------------------------------------
-
-class SimpleRate:
-    def __init__(self, rpm=60, tpm_max=100000):
-        self.rpm = max(1, int(rpm))
-        self.tpm_max = max(1000, int(tpm_max))
-        self.lock = threading.Lock()
-        self.req_times = []  # timestamps of last 60s
-        self.tokens_in_60 = 0
-
-    def admit(self, est_tokens=400):
-        # crude pacing: ensure <= rpm in last 60s and token budget roughly respected
-        while True:
-            with self.lock:
-                now = time.time()
-                self.req_times = [t for t in self.req_times if now - t < 60.0]
-                if len(self.req_times) < self.rpm and self.tokens_in_60 + est_tokens < self.tpm_max:
-                    self.req_times.append(now)
-                    self.tokens_in_60 += est_tokens
+                    pos = rows.index(idx)
+                except ValueError:
                     break
-            time.sleep(0.05)
+                win = rows[max(0,pos-3): pos+4]
+                chunks = []
+                for r in win:
+                    orig = str(df.iloc[r,0]) if r < len(df) else ""
+                    eng = str(df.iloc[r,2]) if r < len(df.columns) else ""
+                    if orig or eng:
+                        chunks.append(f"RU:{orig} / EN:{eng}")
+                s = "\n".join(chunks)
+                return s[-max_chars:]
+    start = max(0, idx-3); end = min(len(df), idx+4)
+    pieces = []
+    for r in range(start, end):
+        orig = str(df.iloc[r,0])
+        eng = str(df.iloc[r,2]) if df.shape[1] > 2 else ""
+        if orig or eng:
+            pieces.append(f"RU:{orig} / EN:{eng}")
+    s = "\n".join(pieces)
+    return s[-max_chars:]
 
-    def decay(self):
+class RPMController:
+    def __init__(self, rpm_init=400, rpm_min=60, rpm_max=1000, auto=True):
+        self.lock = threading.Lock()
+        self.rpm = rpm_init
+        self.rpm_min = rpm_min
+        self.rpm_max = rpm_max
+        self.auto = auto
+        self.last = 0.0
+
+    def before_send(self):
         with self.lock:
             now = time.time()
-            old_len = len(self.req_times)
-            self.req_times = [t for t in self.req_times if now - t < 60.0]
-            if len(self.req_times) != old_len:
-                # rough token decay
-                self.tokens_in_60 = int(self.tokens_in_60 * (len(self.req_times) / max(1, old_len)))
+            if self.rpm <= 0: return
+            interval = 60.0 / self.rpm
+            if self.last == 0.0:
+                self.last = now
+                return
+            delta = now - self.last
+            if delta < interval:
+                time.sleep(interval - delta)
+            self.last = time.time()
 
-# --- Main ------------------------------------------------------------------
+    def after_ok(self):
+        pass
+
+    def after_error(self, e: Exception):
+        if not self.auto: return
+        msg = str(e)
+        if "429" in msg or "rate" in msg.lower():
+            with self.lock:
+                self.rpm = max(self.rpm_min, int(self.rpm * 0.7))
+
+def call_llm(cli, model, prompt, rpm_controller):
+    rpm_controller.before_send()
+    try:
+        rsp = cli.chat.completions.create(
+            model=model,
+            messages=[
+                {"role":"system","content":"You are a professional adult VN localization writer."},
+                {"role":"user","content":prompt}
+            ],
+            temperature=0.6
+        )
+        txt = rsp.choices[0].message.content.strip()
+        rpm_controller.after_ok()
+        return txt
+    except Exception as e:
+        rpm_controller.after_error(e)
+        raise
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--excel", required=True, help="Path to XLSX")
-    ap.add_argument("--sheet", default=None, help="Sheet name (optional)")
+    ap.add_argument("--excel", required=True)
+    ap.add_argument("--sheet", default="0")
     ap.add_argument("--target-lang", default="zh-CN")
-    ap.add_argument("--provider", default=None, help="deepseek/openai; default from settings")
     ap.add_argument("--settings", default="config/settings.local.yaml")
+    ap.add_argument("--provider", default=None)
     ap.add_argument("--glossary", default=None)
-    ap.add_argument("--rpm", type=int, default=60)
-    ap.add_argument("--tpm-max", type=int, default=100000)
-    ap.add_argument("--autosave-every", type=int, default=1, help="Rows per Excel save (1 = per-row)")
-    ap.add_argument("--autosave-seconds", type=float, default=0.0, help="Seconds between Excel saves (0 = every row)")
+    ap.add_argument("--glossary-max", type=int, default=200)
+    ap.add_argument("--context-mode", default="scene", choices=["scene","nearby","none"])
+    ap.add_argument("--autosave-every", type=int, default=300)
+    ap.add_argument("--autosave-seconds", type=int, default=90)
     ap.add_argument("--checkpoint-file", default="artifacts/ckpt.translate.jsonl")
     ap.add_argument("--wal-file", default="artifacts/translate.wal.jsonl")
-    ap.add_argument("--cache-file", default="artifacts/cache.translate.jsonl")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--wal-every", type=int, default=10)
     ap.add_argument("--show-lines", action="store_true")
-    ap.add_argument("--max-chars", type=int, default=120)
+    ap.add_argument("--max-chars", type=int, default=160)
+    ap.add_argument("--rpm", type=int, default=400)
+    ap.add_argument("--rpm-min", type=int, default=60)
+    ap.add_argument("--rpm-max", type=int, default=1000)
+    ap.add_argument("--tpm-max", type=int, default=100000)
+    ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--min-workers", type=int, default=4)
+    ap.add_argument("--max-workers", type=int, default=32)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--est-input-ratio", type=float, default=3.2)
+    ap.add_argument("--est-output-tokens", type=int, default=220)
+    ap.add_argument("--auto-tune", action="store_true")
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    cfg = _settings()
-    provider = (args.provider or cfg.get("provider") or "deepseek")
+    df = load_excel(args.excel, args.sheet)
+    df = ensure_col5(df)
 
-    client, model = build_client(provider, cfg)
-    print(f"[CFG] provider={provider} model={model} rpm={args.rpm} tpm={args.tpm_max}", flush=True)
+    needs = detect_empty_rows(df)
+    total = len(df)
+    to_do = len(needs)
+    print(f"[CFG] provider={(args.provider or 'auto')} rpm_init={args.rpm} tpm_max={args.tpm_max} context_mode={args.context_mode} workers={args.workers} min/max={args.min_workers}/{args.max_workers}")
+    print(f"[PLAN] total={total}, empty(col5)={to_do}, to_translate={to_do}")
 
-    excel_path = Path(args.excel)
-    if not excel_path.exists():
-        raise SystemExit(f"Excel not found: {excel_path}")
+    if to_do == 0:
+        outp = args.out or (str(Path(args.excel).with_suffix(f".{args.target_lang}.llm.xlsx")))
+        df.to_excel(outp, index=False)
+        print(f"[OK] Done. Output -> {outp}")
+        return
 
-    df = pd.read_excel(str(excel_path), sheet_name=args.sheet)
-    # Expect columns 1..5: ru, speaker, en, cn, out
-    # use positional access for robustness
-    def _get(row, idx):
+    cfg = load_settings(Path(args.settings))
+    provider = args.provider or cfg.get("provider") or "deepseek"
+    client, model = openai_client_from_settings(cfg, provider)
+
+    scenes = scenes_from_file()
+    glossary = load_glossary(args.glossary, args.glossary_max)
+    rpmc = RPMController(args.rpm, args.rpm_min, args.rpm_max, auto=args.auto_tune)
+
+    outp = args.out or (str(Path(args.excel).with_suffix(f".{args.target_lang}.llm.xlsx")))
+    ckpt = Path(args.checkpoint_file)
+    wal = Path(args.wal_file)
+    wal.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.resume and Path(outp).exists():
         try:
-            return str(row[idx]) if not (isinstance(row[idx], float) and math.isnan(row[idx])) else ""
+            df_existing = pd.read_excel(outp)
+            if df_existing.shape[1] >= 5:
+                df.iloc[:,4] = df_existing.iloc[:,4]
+                needs = detect_empty_rows(df)
+                to_do = len(needs)
+                print(f"[INFO] resume: loaded previous output, remaining={to_do}")
         except Exception:
+            pass
+
+    q_idx = queue.Queue()
+    for i in needs:
+        q_idx.put(i)
+    lock_write = threading.Lock()
+
+    stats = {"done":0,"ok":0,"err":0}
+    t_last_save = time.time()
+    wal_buf = []
+
+    initial_workers = max(args.min_workers, min(args.workers, args.max_workers))
+    executor = ThreadPoolExecutor(max_workers=initial_workers)
+    futures = []
+
+    def worker_loop():
+        nonlocal t_last_save, wal_buf
+        while True:
             try:
-                return str(row.iloc[idx])
-            except Exception:
-                return ""
-
-    # Prepare output column if not exists
-    if df.shape[1] < 5:
-        # add 5th column
-        while df.shape[1] < 5:
-            df[df.shape[1]] = ""
-    # rows to translate: col5 empty
-    mask_empty = df.iloc[:,4].isna() | (df.iloc[:,4].astype(str).str.strip() == "")
-    to_translate_idx = list(df[mask_empty].index.values.tolist())
-
-    print(f"[PLAN] total={len(df)} empty(col5)={mask_empty.sum()} to_translate={len(to_translate_idx)}", flush=True)
-
-    gls_items, gls_digest = load_glossary(args.glossary) if args.glossary else ([], "no-glossary")
-    cache = JsonlCache(Path(args.cache_file))
-    wal = Wal(Path(args.wal_file))
-    rate = SimpleRate(args.rpm, args.tpm_max)
-
-    # Excel writer thread
-    writer = ExcelWriterThread(excel_path, sheet_name=args.sheet,
-                               flush_every=max(1, args.autosave_every),
-                               flush_seconds=max(0.0, args.autosave_seconds))
-    writer.start()
-
-    # Optional: a simple scene hint using previous/next lines; keep cheap
-    def scene_hint_for(i):
-        ru_prev = df.iloc[i-1,0] if i>0 else ""
-        en_prev = df.iloc[i-1,2] if i>0 else ""
-        ru_next = df.iloc[i+1,0] if i+1<len(df) else ""
-        en_next = df.iloc[i+1,2] if i+1<len(df) else ""
-        parts = []
-        if isinstance(en_prev, str) and en_prev.strip():
-            parts.append(f"Prev: {en_prev}")
-        if isinstance(en_next, str) and en_next.strip():
-            parts.append(f"Next: {en_next}")
-        return " | ".join(parts)[:200]
-
-    # Main loop (sequential for reliability; per-row autosave + cache give robustness)
-    success = 0
-    last_save = time.time()
-    for i in to_translate_idx:
-        ru = str(df.iloc[i,0]) if not pd.isna(df.iloc[i,0]) else ""
-        sp = str(df.iloc[i,1]) if not pd.isna(df.iloc[i,1]) else ""
-        en = str(df.iloc[i,2]) if not pd.isna(df.iloc[i,2]) else ""
-
-        ctx = scene_hint_for(i)
-        key_src = json.dumps({"ru":ru, "en":en, "sp":sp, "ctx":ctx, "gls":gls_digest, "t":args.target_lang}, ensure_ascii=False)
-        key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
-
-        cached = cache.get(key)
-        if cached:
-            out = cached
-            df.iat[i,4] = out
-            # per-row WAL & Excel
-            wal.append({"row": int(i), "speaker": sp, "ru": ru, "en": en, "out": out, "cached": True})
-            # Excel row index: +2 because pandas assumes header row; our file likely has header row
-            writer.submit(i+2, 5, out)
-            success += 1
-            if args.show_lines:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] (cache) row={i} speaker={sp}")
-            continue
-
-        sys_inst, user_msg = make_prompt(args.target_lang, ru, en, sp, ctx, gls_items)
-
-        # pacing
-        est_tokens = max(200, min(800, len(ru)//2 + len(en)))  # crude estimate
-        rate.admit(est_tokens)
-
-        try:
-            rsp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role":"system","content":sys_inst},
-                    {"role":"user","content":user_msg},
-                ],
-                temperature=0.2,
-                top_p=0.9,
-                max_tokens=300,
-            )
-            out = (rsp.choices[0].message.content or "").strip()
-        except Exception as e:
-            print(f"[WARN] API error row={i}: {e}", flush=True)
-            time.sleep(1.0)
-            continue
-
-        # Apply glossary post-fix too (belt and suspenders)
-        out2 = apply_glossary(out, gls_items)
-        df.iat[i,4] = out2
-        cache.put(key, out2)
-
-        # per-row WAL & Excel
-        wal.append({"row": int(i), "speaker": sp, "ru": ru, "en": en, "out": out2, "cached": False})
-        writer.submit(i+2, 5, out2)
-        success += 1
-
-        if args.show_lines:
+                i = q_idx.get_nowait()
+            except queue.Empty:
+                break
             try:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] RU: {ru[:80]}")
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] EN: {en[:80]}")
-            except Exception:
-                pass
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] OUT: {out2[:80]}")
-            print(f"[SEND] row={i} speaker={sp}")
-        print(f"[PROGRESS] {success}/{len(to_translate_idx)}", flush=True)
+                ru = str(df.iloc[i,0]) if df.shape[1] > 0 else ""
+                speaker = str(df.iloc[i,1]) if df.shape[1] > 1 else ""
+                en = str(df.iloc[i,2]) if df.shape[1] > 2 else ""
+                prehint = build_prehint_for_scene(glossary, speaker)
+                ctx = ""
+                if args.context_mode != "none":
+                    ctx = context_for_row(scenes, i, df, args.max_chars)
+                prompt = make_prompt(args.target_lang, prehint, speaker, ru, en, ctx)
+                if args.show_lines:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] RU: {ru}")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] EN: {en}")
+                out = call_llm(client, model, prompt, rpmc)
+                if args.show_lines:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] OUT: {out}")
+                with lock_write:
+                    df.iat[i,4] = out
+                wal_buf.append({"i":i,"out":out})
+                stats["ok"] += 1
+            except Exception as e:
+                stats["err"] += 1
+                print(f"[WARN] row={i} failed: {e}")
+            finally:
+                stats["done"] += 1
+                now = time.time()
+                if (stats["done"] % max(1,args.autosave_every) == 0) or (now - t_last_save >= args.autosave_seconds):
+                    with lock_write:
+                        if wal_buf:
+                            with wal.open("a", encoding="utf-8") as wf:
+                                for rec in wal_buf:
+                                    wf.write(json.dumps(rec, ensure_ascii=False) + "\\n")
+                            wal_buf.clear()
+                        df.to_excel(outp, index=False)
+                    print(f"[OK] autosave -> {outp}")
+                    t_last_save = now
+            q_idx.task_done()
 
-        rate.decay()
+    for _ in range(initial_workers):
+        futures.append(executor.submit(worker_loop))
 
-    # Final save snapshot
-    writer.stop()
-    # Also write a final synthesized output file if requested
-    out_path = args.out or (excel_path.parent / f"{excel_path.stem}.{args.target_lang}.llm.xlsx")
-    try:
-        # reload original workbook to ensure all pending writes are persisted
-        # but the writer.save() already did; here we just re-save under a new name
-        from shutil import copyfile
-        copyfile(excel_path, out_path)
-        print(f"[OK] Done. Output -> {out_path}", flush=True)
-    except Exception:
-        print(f"[OK] Done. (kept in-place) -> {excel_path}", flush=True)
+    print(f"[INFO] running with {initial_workers} workers (fixed in this build).")
+
+    for f in as_completed(futures):
+        pass
+
+    with open(wal, "a", encoding="utf-8") as wf:
+        for rec in wal_buf:
+            wf.write(json.dumps(rec, ensure_ascii=False) + "\\n")
+    df.to_excel(outp, index=False)
+    print(f"[OK] Done. Output -> {outp}")
 
 if __name__ == "__main__":
     main()

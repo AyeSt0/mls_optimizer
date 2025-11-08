@@ -1,0 +1,6 @@
+{
+  "git.enableSmartCommit": true,
+  "git.postCommitCommand": "none",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true
+}

@@ -1,62 +1,70 @@
-
-import argparse, os
-from tqdm import tqdm
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+20_enforce_terms.py — glossary enforcement on col5 with guard
+- Longest-match-first replacements from name_map.json
+- Guard modes: --guard en|ru|both|none  (default: none)
+"""
+import argparse, json, re
+from pathlib import Path
 import pandas as pd
-from mls_optimizer.io_utils import load_excel, save_excel
-from mls_optimizer.config import OptimConfig
-from mls_optimizer.terms import load_name_map, longest_first_pairs, enforce_terms
-from mls_optimizer.checkpoint import Checkpointer
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Enforce glossary terms (longest-first) with progress/resume/autosave")
+def load_glossary(path):
+    data = json.loads(Path(path).read_text("utf-8"))
+    if isinstance(data, dict):
+        return data
+    flat = {}
+    for it in data:
+        if isinstance(it, dict):
+            flat.update(it)
+    return flat
+
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--excel", required=True)
-    ap.add_argument("--sheet", default=None)
+    ap.add_argument("--sheet", default="0")
+    ap.add_argument("--glossary", required=True)
+    ap.add_argument("--guard", choices=["none","en","ru","both"], default="none")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--name-map", required=True)
-    ap.add_argument("--target-lang", default="zh-CN")
-    ap.add_argument("--guard-by", default="BOTH", choices=["EN","RU","BOTH","NONE"])
-    ap.add_argument("--start-row", type=int, default=0)
-    ap.add_argument("--end-row", type=int, default=None)
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--checkpoint-file", default="artifacts/ckpt.enforce.jsonl")
-    ap.add_argument("--autosave-every", type=int, default=500)
     args = ap.parse_args()
 
-    os.makedirs("artifacts", exist_ok=True)
-    df = load_excel(args.excel, args.sheet)
-    cfg = OptimConfig()
-    out_col = df.columns[cfg.col_out]
+    df = pd.read_excel(args.excel, sheet_name=args.sheet)
+    while df.shape[1] < 5: df[f"col_{df.shape[1]}"] = ""
+    gl = load_glossary(args.glossary)
+    keys = sorted(gl.keys(), key=len, reverse=True)
 
-    nm = load_name_map(args.name_map if hasattr(args, "name-map") else args.__dict__["name-map"], target_lang=args.target_lang)
-    pairs = longest_first_pairs(nm)
+    def can_apply(i, key):
+        if args.guard == "none":
+            return True
+        en = str(df.iloc[i,2])
+        ru = str(df.iloc[i,0])
+        if args.guard == "en":
+            return key.lower() in en.lower()
+        if args.guard == "ru":
+            return key.lower() in ru.lower()
+        return (key.lower() in en.lower()) and (key.lower() in ru.lower())
 
-    ckpt = Checkpointer(args.checkpoint_file)
+    # precompile regex dict (word-boundary-ish)
+    regs = [(re.compile(re.escape(k), re.I), gl[k]) for k in keys]
 
-    n = len(df)
-    end = args.end_row if args.end_row is not None else n
+    replaced = 0
+    for i in range(df.shape[0]):
+        s = str(df.iloc[i,4])
+        if not s: continue
+        for rx, repl in regs:
+            if not can_apply(i, rx.pattern.strip("\\").lower()):
+                continue
+            s2 = rx.sub(repl, s)
+            if s2 != s:
+                s = s2
+                replaced += 1
+        df.iat[i,4] = s
 
-    bar = tqdm(total=(end - args.start_row), desc="Enforce terms")
-    changed = 0
-    for i in range(args.start_row, end):
-        if args.resume and (i in ckpt.processed):
-            bar.update(1); continue
-        row = df.iloc[i]
-        zh = "" if pd.isna(row.iloc[cfg.col_out]) else str(row.iloc[cfg.col_out])
-        en = "" if pd.isna(row.iloc[cfg.col_en]) else str(row.iloc[cfg.col_en])
-        ru = "" if pd.isna(row.iloc[cfg.col_ru]) else str(row.iloc[cfg.col_ru])
-        if not zh:
-            bar.update(1); ckpt.mark(i, {"skip":"empty"}); continue
-        new_zh, changes = enforce_terms(zh, en, ru, pairs, guard_by=args.guard_by)
-        if new_zh != zh:
-            df.at[i, out_col] = new_zh
-            changed += 1
-        ckpt.mark(i, {"changed": bool(new_zh != zh), "n": len(changes)})
-        if i % max(1, args.autosave_every) == 0 and i != 0:
-            tmp = args.excel.replace(".xlsx", f".{args.target_lang}.terms.part.xlsx")
-            save_excel(df, tmp)
-        bar.update(1)
-    bar.close()
+    out = Path(args.out) if args.out else Path(args.excel).with_suffix("").with_name(Path(args.excel).stem + ".terms.xlsx")
+    df.to_excel(out, index=False)
+    print(f"[OK] Terms enforced. Replacements: {replaced}")
+    print(f"Output -> {out}")
+    return 0
 
-    out_path = args.out or (args.excel.replace(".xlsx", f".{args.target_lang}.terms.xlsx"))
-    save_excel(df, out_path)
-    print(f"[OK] Enforce done: {changed} changed -> {out_path}")
+if __name__ == "__main__":
+    raise SystemExit(main())
