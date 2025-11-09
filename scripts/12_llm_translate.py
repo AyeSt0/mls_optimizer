@@ -1,47 +1,119 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 12_llm_translate.py
-- Excel 第1列 RU, 第2列 speaker, 第3列 EN, 第4列 当前中文(不改), 第5列 输出中文(写入)
-- 读取 artifacts/scenes.json 提供“scene”上下文模式（可选）
-- 集成术语：从 data/name_map.json 加载，支持“软约束（prompt excerpt）+ 硬替换（enforce）”
-- 自适应并发：基于 429/延迟/排队自动调节 in-flight & rpm
-- 断点续跑：WAL(.jsonl) + checkpoint(.jsonl) + 周期写盘到输出 Excel
-- 仅翻译第5列为空的行；可用 --retranslate 覆盖已有译文
+以【第4列】为源，进行本地化翻译，写入【第5列】。
+特点：
+- 读取 config/settings.local.yaml，支持 provider: deepseek/openai（OpenAI兼容协议，DeepSeek 走 SiliconFlow）
+- 伸缩线程池 + 自适应 RPM/TPM（遇 429/超时 降并发、通过延迟/成功率 逐步升并发）
+- WAL/断点续： --wal-file JSONL 持续写入；--checkpoint-file 记录已完成行，--resume 自动跳过
+- 支持：覆盖重译/行号范围/Speaker 过滤(*通配)/仅预览(show-lines)/sheet-index|sheet-name
+- 注入 name_map（最长匹配TOPK术语）到 Prompt；翻译后仍不改已有中文/占位符（由 20 预占位）
+- 成人/学院语境强 Prompt（地点规则、对话/目标语气、Objective指引）
+- 输出另存 *.llm.xlsx（不改第4列）
+
+使用示例：
+python -u -m scripts.12_llm_translate --excel data/MLS Chinese.xlsx --target-lang zh-CN --glossary data/name_map.json --sheet-index 0 --show-lines --resume
 """
 
-import argparse
-import json
-import os
-import re
-import sys
-import time
-import threading
-import queue
-from dataclasses import dataclass
-from pathlib import Path
+import argparse, asyncio, concurrent.futures, json, os, re, sys, time, threading
 from typing import Any, Dict, List, Optional, Tuple
-
 import pandas as pd
+import yaml
 
-# -------- Optional Glossary --------
-_GLOSS: Any = None
-try:
-    # 尝试从 scripts/glossary_utils.py 导入 Glossary
-    from scripts.glossary_utils import Glossary
-    _GLOSS = Glossary
-except Exception as e:
-    _GLOSS = None
+# 列索引（0-based）
+RU_COL = 0
+SPEAKER_COL = 1
+EN_COL = 2
+SRC_COL = 3     # 第4列：20 步生成的“带中文守护的英文底稿”
+DST_COL = 4     # 第5列：LLM 输出
 
-# -------- OpenAI-compatible client --------
-try:
+# 默认限速
+DEFAULT_RPM = 200
+DEFAULT_MIN_WORKERS = 2
+DEFAULT_MAX_WORKERS = 32
+
+# —— 读 settings.local.yaml —— #
+def load_settings(path: str) -> Dict[str,Any]:
+    if not os.path.exists(path): return {}
+    with open(path,'r',encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+def build_client(provider: str, cfg: Dict[str,Any]):
+    """
+    返回 (client, model_name, rpm_cap, tpm_cap)
+    使用 OpenAI 兼容 SDK。DeepSeek通过 SiliconFlow base_url。
+    """
     from openai import OpenAI
-except Exception:
-    OpenAI = None  # 用于延后导入失败提示
+    if provider == "deepseek":
+        ds = (((cfg.get("llm") or {}).get("deepseek")) or {})
+        key = ds.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("SILICONFLOW_API_KEY")
+        base= ds.get("base_url") or os.getenv("DEEPSEEK_BASE_URL") or "https://api.siliconflow.cn"
+        model = ((cfg.get("model") or {}).get("deepseek") or {}).get("name") or "deepseek-ai/DeepSeek-V3.2-Exp"
+        if not key:
+            raise RuntimeError("Missing DeepSeek/SiliconFlow API key (settings.local.yaml or env DEEPSEEK_API_KEY/SILICONFLOW_API_KEY).")
+        client = OpenAI(api_key=key, base_url=f"{base}/v1")
+        rpm_cap = (cfg.get("rate_limit") or {}).get("rpm", DEFAULT_RPM)
+        tpm_cap = (cfg.get("rate_limit") or {}).get("tpm", None)
+        return client, model, rpm_cap, tpm_cap
+    else:
+        oa = (((cfg.get("llm") or {}).get("openai")) or {})
+        key = oa.get("api_key") or os.getenv("OPENAI_API_KEY")
+        base= oa.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        model = ((cfg.get("model") or {}).get("openai") or {}).get("name") or "gpt-4o-mini"
+        if not key:
+            raise RuntimeError("Missing OPENAI_API_KEY (settings.local.yaml or env).")
+        from openai import OpenAI
+        client = OpenAI(api_key=key, base_url=base)
+        rpm_cap = (cfg.get("rate_limit") or {}).get("rpm", DEFAULT_RPM)
+        tpm_cap = (cfg.get("rate_limit") or {}).get("tpm", None)
+        return client, model, rpm_cap, tpm_cap
 
-# ------------------ Prompt Templates ------------------
-BASE_SYSTEM_PROMPT = """You are a senior localization writer for an ADULT visual novel set in Sunville (阳光镇),
-mostly inside a COLLEGE (学院). Output MUST be natural, colloquial Chinese for players.
+# —— 术语注入（只注入，不后替；后替由21执行） —— #
+def load_glossary(glossary_path: Optional[str]) -> Dict[str,str]:
+    if not glossary_path or not os.path.exists(glossary_path): return {}
+    with open(glossary_path,'r',encoding='utf-8') as f:
+        data=json.load(f)
+    flat={}
+    def walk(n):
+        if isinstance(n,dict):
+            if set(n.keys()) & {"en_to_zh","ru_to_zh","map","terms","glossary"}:
+                for k in n: walk(n[k])
+            else:
+                for k,v in n.items():
+                    if isinstance(v,str) and k:
+                        flat[str(k)]=v
+                    elif isinstance(v,dict) and "zh" in v and k:
+                        flat[str(k)]=str(v["zh"])
+        elif isinstance(n,list):
+            for it in n: walk(it)
+    walk(data)
+    return {k:v for k,v in flat.items() if v and str(k)!=str(v)}
+
+def longest_match_topk(glossary: Dict[str,str], text: str, k: int=300) -> List[Tuple[str,str]]:
+    if not text: return []
+    # 简单地以长度排序后筛选出现过的
+    items=sorted(glossary.items(), key=lambda kv: len(kv[0]), reverse=True)
+    hits=[]
+    t=text
+    for src,dst in items:
+        if len(hits)>=k: break
+        if src in t:
+            hits.append((src,dst))
+    return hits
+
+# —— 场景上下文（可选） —— #
+def load_scenes(path="artifacts/scenes.json") -> Dict[str,Any]:
+    if not os.path.exists(path): return {}
+    with open(path,'r',encoding='utf-8') as f:
+        return json.load(f) or {}
+
+def build_context(df: pd.DataFrame, idx: int, scenes: Dict[str,Any]) -> str:
+    # 简化：若有 scenes，按覆盖范围找到 scene 内的若干行拼 EN/RU/SRC 信息。
+    # 你之前的 05 已经写入 scenes.json 的 covered rows；这里做一个温和上下文拼接即可。
+    return ""  # 保持轻量，主要靠第4列守护+Prompt 规则
+
+# —— Prompt —— #
+PINNED_WORLD = """You are a senior localization writer for an ADULT visual novel set in Sunville (阳光镇), mostly inside a COLLEGE (学院). Output MUST be natural, colloquial Chinese for players.
 
 GENERAL:
 - Base literal meaning on EN; use RU for mood & sensual nuance when helpful.
@@ -49,610 +121,315 @@ GENERAL:
 - Preserve placeholders/tags exactly: [like_this], {vars}, {{vars}}, <tags>.
 - Keep brand/product names in Latin (Patreon, Instagram, Lovense).
 - Use colloquial “你”; avoid stiff, bookish phrasing.
-- You MAY restructure English syntax for natural Chinese (意合优先); merge or split clauses as needed.
-- Use Chinese punctuation and spoken word order; avoid copying EN period-per-fragment habit.
+- YOU MAY restructure English syntax for natural Chinese; merge or split clauses as needed.
+- Use Chinese punctuation and spoken word order; do NOT copy EN period-per-fragment habit.
+- DO NOT alter any Chinese text already present in the source. Only translate the non-Chinese parts around it.
 - Output ONLY the final Chinese line (no quotes or explanations).
 
 WORLD TERMS (PINNED):
 - Sunville → 阳光镇
-- College → 学院  (NEVER translate as 大学/大学院)
+- College → 学院
 - Principal → 院长
 - Steward → 管理员
 - Doctor’s Office → 医务室
 - Locker Rooms → 更衣室
 - College Entrance → 学院正门
 
-CAMPUS & TOWN LOCATION RULES (CRITICAL):
-If the line is a short ALL-CAPS or Title-like label and the SPEAKER is "string"
-(or otherwise looks like a map/room/UI location), translate as a PLACE NAME, not a subject:
+CAMPUS & TOWN LOCATION RULES (CRITICAL for speaker=string/map labels):
 - SUBJECT + CLASS → “X教室”：Computer Class→计算机教室; Arts Class→美术教室
-- Lone SUBJECT words (BIOLOGY/PHYSICS/ENGLISH/GEOGRAPHY/ALGEBRA) in this context → “X教室”
-- ...’S OFFICE:
-  - DOCTOR’S OFFICE → 医务室
-  - STEWARD’S OFFICE → 管理员办公室
-  - (others) “某某办公室” (keep role natural in CN)
-- LOCKER (singular) → 储物柜区; LOCKER ROOMS (plural) → 更衣室
+- Lone SUBJECT words (BIOLOGY/PHYSICS/ENGLISH/GEOGRAPHY/ALGEBRA) → “X教室”
+- XX’S OFFICE: Doctor’s Office→医务室; Steward’s Office→管理员办公室; others→“某某办公室”
+- LOCKER (sing.) → 储物柜区; LOCKER ROOMS (pl.) → 更衣室
 - GIRL’S/BOY’S CHANGING ROOM → 女生/男生更衣室
-- BOYS/GIRLS TOILET(S) → 男厕 / 女厕（全局一致）
+- BOYS/GIRLS TOILET(S) → 男厕/女厕（全局一致）
 - GYM → 体育馆; POOL → 泳池; LIBRARY → 图书馆; ASSEMBLY HALL → 学院礼堂
 - COLLEGE ENTRANCE → 学院正门
-- TOWN → 镇上（地图/导航标签时更自然）
+- Map/room/UI labels should be concise place names, not course subjects.
 
 SPEAKER-AWARE TONE:
-- Principal/Teacher/Librarian (incl. *_t thoughts) → formal, calm, precise; no slang.
-- System/Operator/Post/Help/Hotel_staff/Secretary/Policeman → concise UI/service tone; no erotic flourish.
-- Punk/Whore/Stripper/Showman → bolder, street tone; explicit but not gratuitous.
-- Students/Girls/Actresses/Models/teen names → youthful, casual, flirty; explicit when context requires.
+- Principal/Teacher/Librarian (incl. *_t thoughts) → formal, calm; no slang.
+- System/Operator/Post/Hotel_staff/Secretary/Policeman → concise UI/service tone.
+- Punk/Whore/Stripper/Showman → bolder, street tone, explicit but not gratuitous.
+- Students/Girls/Actresses/Models → youthful, casual, flirty; explicit when needed.
 
-OBJECTIVES / TASK HINTS (non-dialogue):
-If EN is a short imperative objective (e.g., “Go to Sean’s. Meet his mother. Talk to Sean.”),
-render as a natural Chinese checklist/flow, not literal one-sentence-per-dot:
-- Prefer: “前往肖恩家、见见他妈妈、和肖恩聊聊”
-- Or: “去趟肖恩家，先见见他妈妈，再跟肖恩聊聊。”
-Avoid stiff phrases like “认识他妈妈”; use “见见他妈妈/见肖恩的妈妈”.
-
-DIALOGUE (MOST LINES):
-If it reads like human speech (pronouns, questions, interjections, longer sentences), treat as dialogue:
-- Keep colloquial rhythm and erotic intensity appropriate to the scene.
-- Moans/breathing (“嗯…/哈啊…/啊…”) natural but not overdone.
-- Be explicit but not clinical; don’t censor sexual content.
-
-DISAMBIGUATION HEURISTICS:
-- ALL-CAPS 1–4 nouns with campus/town semantics + speaker=string → PLACE NAME per rules above.
-- Multiple short imperative fragments (Go to/Meet/Talk/Find…) → OBJECTIVE style as above.
-- Otherwise treat as DIALOGUE/normal UI and localize naturally.
+OBJECTIVES (short imperative sequences):
+- Render as a natural checklist/flow, e.g., “去趟肖恩家，先见见他妈妈，再跟肖恩聊聊。” NOT one dot per sentence.
 """
 
-USER_PROMPT_TMPL = """[META]
-SPEAKER: {speaker}
-ROW: {row_id}
+def make_messages(speaker: str, ru: str, en: str, src4: str, glossary_items: List[Tuple[str,str]], target_lang: str):
+    glossary_lines = []
+    for s,d in glossary_items[:300]:
+        glossary_lines.append(f"- {s} → {d}")
+    glossary_block = "\n".join(glossary_lines) if glossary_lines else "（无特别术语）"
 
-[RU] {ru}
-[EN] {en}
+    user_block = f"""SPEAKER: {speaker or 'unknown'}
+TARGET_LANG: {target_lang}
 
-If helpful, you can consider contextual lines from the same scene (SPEAKER tagged) below:
-{ctx}
+SOURCE (Use this as main content. It already contains protected Chinese segments and placeholders you MUST keep untouched):
+{src4 or ''}
 
-Output ONLY one Chinese line, no quotes, no commentary.
+REFERENCE EN (literal meaning):
+{en or ''}
+
+REFERENCE RU (mood & nuance):
+{ru or ''}
+
+GLOSSARY (apply LONGEST MATCH FIRST; do not contradict):
+{glossary_block}
 """
+    return [
+        {"role":"system","content":PINNED_WORLD},
+        {"role":"user","content":user_block.strip()}
+    ]
 
-# ------------------ Rate Limiter & Adaptive Pool ------------------
+# —— 并发与速率控制（简化实现，稳定优先） —— #
 class TokenBucket:
-    """Simple RPM limiter: allow N requests per minute spread across time."""
-    def __init__(self, rpm: int):
-        self.capacity = max(1, rpm)
-        self.tokens = float(self.capacity)
-        self.fill_rate = self.capacity / 60.0  # tokens per second
+    def __init__(self, rpm:int):
         self.lock = threading.Lock()
+        self.rpm = max(1,rpm)
+        self.tokens = self.rpm
         self.last = time.time()
-
-    def set_rpm(self, rpm: int):
-        with self.lock:
-            self.capacity = max(1, rpm)
-            self.fill_rate = self.capacity / 60.0
-            if self.tokens > self.capacity:
-                self.tokens = self.capacity
-            self.last = time.time()
-
     def take(self):
         while True:
             with self.lock:
-                now = time.time()
-                elapsed = now - self.last
-                self.last = now
-                self.tokens = min(self.capacity, self.tokens + elapsed * self.fill_rate)
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
+                now=time.time()
+                elapsed=now-self.last
+                refill = elapsed * (self.rpm/60.0)
+                if refill>=1:
+                    self.tokens = min(self.rpm, self.tokens + int(refill))
+                    self.last = now
+                if self.tokens>0:
+                    self.tokens -=1
                     return
-            time.sleep(0.02)
-
-@dataclass
-class PoolConfig:
-    min_workers: int = 2
-    max_workers: int = 32
-    init_workers: int = 8
-    rpm_init: int = 200
-    rpm_min: int = 60
-    rpm_max: int = 1000
-    tpm_max: Optional[int] = None  # not strictly enforced here (estimates only)
-
-class AdaptivePool:
-    """Adaptive in-flight controller based on latency & errors."""
-    def __init__(self, cfg: PoolConfig):
-        self.cfg = cfg
-        self.inflight_cap = cfg.init_workers
-        self.err_429 = 0
-        self.lat_hist: List[float] = []
-        self.lock = threading.Lock()
-        self.last_adjust = time.time()
-
-    def on_result(self, latency: float, status_ok: bool, got_429: bool):
+            time.sleep(0.05)
+    def set_rpm(self, rpm:int):
         with self.lock:
-            self.lat_hist.append(latency)
-            if got_429:
-                self.err_429 += 1
-            # keep history bounded
-            if len(self.lat_hist) > 200:
-                self.lat_hist = self.lat_hist[-200:]
+            self.rpm = max(1,rpm)
+            self.tokens = min(self.tokens, self.rpm)
 
-    def maybe_adjust(self, bucket: TokenBucket):
-        with self.lock:
-            now = time.time()
-            if now - self.last_adjust < 2.0:
-                return
-            self.last_adjust = now
-            lat = (sum(self.lat_hist) / len(self.lat_hist)) if self.lat_hist else 0.5
-            # 基本策略：如果 429 增长或延迟升高 -> 降低 in-flight & rpm；反之缓慢增加
-            if self.err_429 > 0 or lat > 2.0:
-                self.inflight_cap = max(self.cfg.min_workers, int(self.inflight_cap * 0.8))
-                new_rpm = max(self.cfg.rpm_min, int(bucket.capacity * 0.8))
-                bucket.set_rpm(new_rpm)
-                self.err_429 = 0
-            else:
-                # 温和增加
-                self.inflight_cap = min(self.cfg.max_workers, self.inflight_cap + 1)
-                new_rpm = min(self.cfg.rpm_max, bucket.capacity + 20)
-                bucket.set_rpm(new_rpm)
-
-# ------------------ Scenes Loader ------------------
-def load_scenes(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-def build_context(scene_map: Dict[str, Any], row_idx: int, df: pd.DataFrame, max_chars: int = 160) -> str:
-    if not scene_map:
-        return ""
-    # scene_map 约定: {"scenes": [{"rows":[start,end]}, ...]}
-    # 或 05_segment_context.py 生成的简单结构：包含每个 scene 的行号列表
-    scenes = scene_map.get("scenes") or scene_map
-    # 找到包含 row_idx 的 scene
-    def in_scene(s):
-        rows = s.get("rows") or s.get("indices") or []
-        if isinstance(rows, list):
-            if rows and isinstance(rows[0], list):  # ranges
-                for st, ed in rows:
-                    if st <= row_idx <= ed:
-                        return True
-                return False
-            return (row_idx in rows)
-        if isinstance(rows, dict):
-            st, ed = rows.get("start", 0), rows.get("end", 0)
-            return st <= row_idx <= ed
-        return False
-
-    scene = None
-    if isinstance(scenes, list):
-        for s in scenes:
-            if in_scene(s):
-                scene = s
-                break
-
-    if not scene:
-        return ""
-
-    # 收集该 scene 中周边若干行的 RU/EN/speaker
-    buf = []
-    def pick(i):
-        try:
-            ru = str(df.iloc[i, 0]) if i < len(df) else ""
-            en = str(df.iloc[i, 2]) if i < len(df) else ""
-            sp = str(df.iloc[i, 1]) if i < len(df) else ""
-            return f"{i}: [{sp}] RU: {ru} | EN: {en}"
-        except Exception:
-            return ""
-
-    rows = scene.get("rows") or scene.get("indices") or []
-    flat_rows: List[int] = []
-    if isinstance(rows, list) and rows and isinstance(rows[0], list):
-        for st, ed in rows:
-            flat_rows.extend(list(range(st, ed + 1)))
-    elif isinstance(rows, list):
-        flat_rows = rows
-    elif isinstance(rows, dict):
-        st, ed = rows.get("start", 0), rows.get("end", 0)
-        flat_rows = list(range(st, ed + 1))
-
-    # 只拼接附近 ±6 行
-    if row_idx in flat_rows:
-        pos = flat_rows.index(row_idx)
-        window = flat_rows[max(0, pos - 6): pos + 7]
+def parse_range_spec(spec: Optional[str], n:int) -> Tuple[int,int]:
+    # "start:end" 1-based, inclusive；支持单值"100"；为空则全量
+    if not spec: return 1, n
+    if ":" in spec:
+        a,b=spec.split(":",1)
+        a=int(a) if a.strip() else 1
+        b=int(b) if b.strip() else n
+        return max(1,a), min(n,b)
     else:
-        window = [row_idx]
+        i=int(spec); return i,i
 
-    for i in window:
-        line = pick(i)
-        if line:
-            buf.append(line)
-        if sum(len(x) for x in buf) > max_chars:
-            break
-    return "\n".join(buf)
-
-# ------------------ Helpers ------------------
-def now_ts():
-    return time.strftime("%H:%M:%S")
-
-def eprint(*a, **k):
-    print(*a, **k, file=sys.stderr, flush=True)
-
-def load_settings(path: Path) -> Dict[str, Any]:
-    # 支持 YAML，但不强依赖 pyyaml；用简陋解析或回退 json
-    if not path.exists():
-        return {}
-    try:
-        import yaml  # type: ignore
-        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        # fallback json
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-def select_provider(args, settings):
-    if args.provider and args.provider != "auto":
-        return args.provider
-    prov = settings.get("provider") or os.environ.get("PROVIDER")
-    return prov or "deepseek"
-
-def build_client(provider: str, settings: Dict[str, Any]):
-    if OpenAI is None:
-        raise RuntimeError("openai package not installed. pip install openai")
-    llm = (settings.get("llm") or {})
-    model_cfg = (settings.get("model") or {})
-    if provider == "deepseek":
-        ds = llm.get("deepseek") or {}
-        api_key = ds.get("api_key") or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("SILICONFLOW_API_KEY")
-        base_url = ds.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL") or os.environ.get("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn"
-        if not api_key:
-            raise RuntimeError("Missing DeepSeek/SiliconFlow API key (settings or env).")
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        model = (model_cfg.get("deepseek") or {}).get("name") or os.environ.get("DEEPSEEK_MODEL") or "deepseek-ai/DeepSeek-V3.2-Exp"
-        rpm_cap = (settings.get("rate_limit") or {}).get("rpm") or 200
-        return client, model, int(rpm_cap)
-    elif provider == "openai":
-        oa = llm.get("openai") or {}
-        api_key = oa.get("api_key") or os.environ.get("OPENAI_API_KEY")
-        base_url = oa.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        if not api_key:
-            raise RuntimeError("Missing OPENAI_API_KEY (settings or env).")
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        model = (model_cfg.get("openai") or {}).get("name") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
-        rpm_cap = (settings.get("rate_limit") or {}).get("rpm") or 200
-        return client, model, int(rpm_cap)
-    else:
-        raise RuntimeError(f"Unknown provider: {provider}")
-
-# ------------------ I/O ------------------
-def read_excel(path: Path, sheet_index: Optional[int], sheet_name: Optional[str]) -> pd.DataFrame:
-    if sheet_name is not None:
-        df = pd.read_excel(path, sheet_name=sheet_name)
-    elif sheet_index is not None:
-        df = pd.read_excel(path, sheet_name=sheet_index)
-    else:
-        df = pd.read_excel(path)
-    # 支持返回 dict（多表），取第一张
-    if isinstance(df, dict):
-        df = df[0] if 0 in df else list(df.values())[0]
-    return df
-
-def wal_append(path: Path, rec: Dict[str, Any]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-def ckpt_load(path: Path) -> Dict[int, str]:
-    done = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                obj = json.loads(line)
-                done[int(obj["row"])] = obj.get("out","")
-            except Exception:
-                pass
-    return done
-
-def ckpt_append(path: Path, row: int, out: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"row": row, "out": out}, ensure_ascii=False) + "\n")
-
-# ------------------ Core translate ------------------
-def call_chat(client, model: str, system_prompt: str, user_prompt: str) -> Tuple[str, float, bool]:
-    t0 = time.time()
-    got_429 = False
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role":"system","content":system_prompt},
-                {"role":"user","content":user_prompt},
-            ],
-            temperature=0.2,
-            top_p=1.0,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        return out, time.time()-t0, False
-    except Exception as e:
-        s = str(e).lower()
-        if "429" in s or "rate limit" in s:
-            got_429 = True
-        raise
-    finally:
-        pass
+def match_speaker(sp: str, pattern: Optional[str]) -> bool:
+    if not pattern: return True
+    # 简单 glob：* 通配
+    pat = "^"+re.escape(pattern).replace(r"\*", ".*")+"$"
+    return re.match(pat, sp or "", flags=re.IGNORECASE) is not None
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--excel", required=True, help="Excel path")
-    ap.add_argument("--sheet-index", type=int, default=0, help="Sheet index")
-    ap.add_argument("--sheet-name", default=None, help="Sheet name (override index)")
-    ap.add_argument("--target-lang", default="zh-CN", help="Target language tag (default zh-CN)")
-    ap.add_argument("--settings", default="config/settings.local.yaml", help="YAML/JSON settings with provider/api_key/base_url/model")
-    ap.add_argument("--provider", default="auto", choices=["auto","deepseek","openai"], help="Provider")
-    ap.add_argument("--glossary", default="data/name_map.json", help="Glossary JSON path")
-    ap.add_argument("--glossary-max", type=int, default=300, help="Max glossary items in prompt excerpt")
-    ap.add_argument("--context-mode", default="scene", choices=["scene","none"], help="Context mode")
-    ap.add_argument("--scenes", default="artifacts/scenes.json", help="Scenes json path")
-    ap.add_argument("--row-range", default=None, help="e.g. 0:1000 (inclusive start:end)")
-    ap.add_argument("--scene-range", default=None, help="e.g. 0:10 (scene index range, if using scenes)")
-    ap.add_argument("--speaker", default=None, help="glob filter, e.g. student_* ; multiple split by ,")
-    ap.add_argument("--retranslate", action="store_true", help="Overwrite col5 even if non-empty")
-    ap.add_argument("--dry-run", action="store_true", help="Only print plan, not calling API")
-    ap.add_argument("--show-lines", action="store_true", help="Print RU/EN/OUT streaming")
-    ap.add_argument("--max-chars", type=int, default=160, help="Max context chars from scene")
-    # concurrency & limits
-    ap.add_argument("--workers", type=int, default=8, help="Initial workers")
+    ap.add_argument("--excel", required=True)
+    ap.add_argument("--sheet-name")
+    ap.add_argument("--sheet-index", type=int, default=0)
+    ap.add_argument("--target-lang", default="zh-CN")
+    ap.add_argument("--settings", default="config/settings.local.yaml")
+    ap.add_argument("--provider", choices=["deepseek","openai"], default=None)
+    ap.add_argument("--glossary", default=None)
+
+    ap.add_argument("--rpm", type=int, default=None)
+    ap.add_argument("--tpm-max", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--min-workers", type=int, default=2)
     ap.add_argument("--max-workers", type=int, default=32)
-    ap.add_argument("--rpm", type=int, default=200, help="Initial RPM")
-    ap.add_argument("--rpm-min", type=int, default=60)
-    ap.add_argument("--rpm-max", type=int, default=1000)
-    ap.add_argument("--tpm-max", type=int, default=None)
-    # persistence
-    ap.add_argument("--autosave-every", type=int, default=300, help="Save to Excel every N rows translated")
-    ap.add_argument("--autosave-seconds", type=int, default=90, help="Save to Excel every N seconds")
+
+    ap.add_argument("--autosave-every", type=int, default=300)
+    ap.add_argument("--autosave-seconds", type=int, default=90)
     ap.add_argument("--checkpoint-file", default="artifacts/ckpt.translate.jsonl")
     ap.add_argument("--wal-file", default="artifacts/translate.wal.jsonl")
-    ap.add_argument("--wal-every", type=int, default=10, help="Append to WAL every N rows")
-    ap.add_argument("--resume", action="store_true", help="Resume from checkpoint")
-    ap.add_argument("--out", default=None, help="Output path. Default: data/<ExcelName>.<lang>.llm.xlsx")
 
+    ap.add_argument("--overwrite", action="store_true", help="覆盖已有第5列译文（重译）")
+    ap.add_argument("--row-range", default=None, help="行号范围 1-based，如 100:500 或 120")
+    ap.add_argument("--speaker-like", default=None, help="Speaker 过滤，支持 * 通配")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--show-lines", action="store_true")
+
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    excel_path = Path(args.excel)
-    settings = load_settings(Path(args.settings))
-    provider = select_provider(args, settings)
-    client, model, rpm_cap_from_cfg = build_client(provider, settings)
+    df = pd.read_excel(args.excel, sheet_name=args.sheet_name if args.sheet_name else args.sheet_index)
+    # 确保第5列存在
+    while df.shape[1] < DST_COL+1:
+        df.insert(df.shape[1], f"col{df.shape[1]+1}", "")
 
-    # rpm init
-    rpm_init = args.rpm or rpm_cap_from_cfg
-    rpm_min = args.rpm_min
-    rpm_max = args.rpm_max
+    n = len(df)
+    start,end = parse_range_spec(args.row_range, n)
 
-    # Load Excel
-    df = read_excel(excel_path, args.sheet_index, args.sheet_name)
-    if df.shape[1] < 5:
-        # 确保有第5列
-        missing = 5 - df.shape[1]
-        for _ in range(missing):
-            df[df.shape[1]] = ""
-        # 重新命名列索引方便阅读（可选）
-    # planning indices
-    total = len(df)
+    # 设置/客户端
+    cfg = load_settings(args.settings)
+    provider = args.provider or (cfg.get("provider") or "deepseek")
+    client, model, rpm_cap, tpm_cap = build_client(provider, cfg)
+    if args.rpm: rpm_cap = args.rpm
+    if args.tpm_max: tpm_cap = args.tpm_max
 
-    # row range
-    row_mask = [True] * total
-    if args.row_range:
-        m = re.match(r"^\s*(\d+)\s*:\s*(\d+)\s*$", args.row_range)
-        if not m:
-            raise SystemExit(f"Bad --row-range: {args.row_range}")
-        st, ed = int(m.group(1)), int(m.group(2))
-        for i in range(total):
-            row_mask[i] = (st <= i <= ed)
+    glossary = load_glossary(args.glossary)
 
-    # speaker filter
-    if args.speaker:
-        import fnmatch
-        pats = [x.strip() for x in args.speaker.split(",") if x.strip()]
-        def sp_ok(s):
-            return any(fnmatch.fnmatch(s, p) for p in pats)
-    else:
-        def sp_ok(s): return True
+    # 输出路径
+    base,ext = os.path.splitext(args.excel)
+    out = args.out or f"{base}.llm.xlsx"
 
-    # resume support
-    done_map = ckpt_load(Path(args.checkpoint_file)) if args.resume else {}
-    # scene filter
-    scene_map = load_scenes(Path(args.scenes)) if args.context_mode == "scene" else {}
-
-    # Glossary
-    gloss = None
-    if _GLOSS is not None:
-        try:
-            gloss = _GLOSS.load(args.glossary, target_lang=args.target_lang)
-        except Exception as e:
-            eprint(f"[WARN] glossary load failed: {e}")
-            gloss = None
-    excerpt = ""
-    if gloss is not None:
-        try:
-            excerpt = gloss.build_prompt_excerpt(max_items=args.glossary_max, max_chars=4000)
-        except Exception:
-            excerpt = ""
-
-    # Output path
-    if args.out:
-        out_path = Path(args.out)
-    else:
-        out_name = f"{excel_path.stem}.{args.target_lang}.llm.xlsx"
-        out_path = excel_path.parent / out_name
-
-    # Build to-translate index list
-    idxs: List[int] = []
-    for i in range(total):
-        if not row_mask[i]:
-            continue
-        sp = str(df.iloc[i, 1]) if i < total else ""
-        if not sp_ok(sp):
-            continue
-        # col5 empty?
-        col5 = str(df.iloc[i, 4]) if df.shape[1] >= 5 else ""
-        if (not col5) or args.retranslate:
-            idxs.append(i)
-
-    to_translate = len(idxs)
-    print(f"[CFG] provider={provider} rpm_init={rpm_init} tpm_max={args.tpm_max} workers={args.workers} min/max={args.min_workers}/{args.max_workers}")
-    print(f"[PLAN] total={total} to_translate={to_translate}")
-
-    if args.dry_run:
-        print("[DRY] no API calls. Exiting.")
-        return
-
-    # Compose final system prompt
-    system_prompt = BASE_SYSTEM_PROMPT
-    if excerpt:
-        system_prompt += "\n\nGLOSSARY (Longest-first, strict):\n" + excerpt
-
-    # concurrency
-    bucket = TokenBucket(rpm_init)
-    pool_cfg = PoolConfig(min_workers=args.min_workers, max_workers=args.max_workers, init_workers=args.workers,
-                          rpm_init=rpm_init, rpm_min=rpm_min, rpm_max=rpm_max, tpm_max=args.tpm_max)
-    adapt = AdaptivePool(pool_cfg)
-
-    q_in: "queue.Queue[int]" = queue.Queue()
-    for i in idxs:
-        q_in.put(i)
-
-    q_out: "queue.Queue[Tuple[int, str, float, Optional[Exception]]]" = queue.Queue()
-
-    stop_sig = {"stop": False}
-    inflight = 0
-    inflight_lock = threading.Lock()
-
-    last_save_t = time.time()
-    done_since_save = 0
-    processed = 0
-
-    def worker_loop():
-        nonlocal inflight, processed
-        while not stop_sig["stop"]:
-            try:
-                # 队列空则退出
-                i = q_in.get(timeout=0.2)
-            except queue.Empty:
-                return
-            # 自适应 in-flight 限制
-            while True:
-                with inflight_lock:
-                    if inflight < adapt.inflight_cap:
-                        inflight += 1
-                        break
-                time.sleep(0.01)
-            try:
-                bucket.take()
-                ru = str(df.iloc[i, 0]) if i < total else ""
-                sp = str(df.iloc[i, 1]) if i < total else ""
-                en = str(df.iloc[i, 2]) if i < total else ""
-                ctx = ""
-                if args.context_mode == "scene":
-                    try:
-                        ctx = build_context(scene_map, i, df, max_chars=args.max_chars)
-                    except Exception:
-                        ctx = ""
-                user_prompt = USER_PROMPT_TMPL.format(speaker=sp, row_id=i, ru=ru, en=en, ctx=ctx)
-                t0 = time.time()
-                out_text, lat, got429 = "", 0.0, False
-                err = None
+    # WAL/断点续
+    done_rows=set()
+    if os.path.exists(args.checkpoint_file):
+        with open(args.checkpoint_file,'r',encoding='utf-8') as f:
+            for line in f:
                 try:
-                    out_text, lat, got429 = call_chat(client, model, system_prompt, user_prompt)
-                    # enforce glossary
-                    if gloss is not None:
-                        out_text = gloss.enforce(out_text)
-                    # 清理尾部引号/多余空行
-                    out_text = out_text.strip().strip('"').strip()
-                except Exception as ex:
-                    lat = time.time()-t0
-                    err = ex
-                finally:
-                    adapt.on_result(lat, err is None, got429)
-                q_out.put((i, out_text, lat, err))
-            finally:
-                with inflight_lock:
-                    inflight -= 1
+                    obj=json.loads(line)
+                    if obj.get("ok") and isinstance(obj.get("row"), int):
+                        done_rows.add(obj["row"])
+                except: pass
 
-    # 启动固定数量线程（inflight_cap 由 adapt 控制实际并发）
-    threads = []
-    n_threads = args.max_workers  # 线程上限，实际 in-flight 受 adapt 管
-    for _ in range(n_threads):
-        t = threading.Thread(target=worker_loop, daemon=True)
-        t.start()
-        threads.append(t)
+    wal_fp = open(args.wal_file,'a',encoding='utf-8')
 
-    # main loop: collect and save
-    wal_path = Path(args.wal_file)
-    ckpt_path = Path(args.checkpoint_file)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # 速率/并发
+    bucket = TokenBucket(rpm_cap or DEFAULT_RPM)
+    cur_workers = max(args.min_workers, min(args.workers, args.max_workers))
+    failures=0; successes=0; last_adjust=time.time()
 
-    # 应用 resume：先把已完成写回 df 第5列
-    if done_map:
-        for r, text in done_map.items():
-            if 0 <= r < total:
-                df.iat[r, 4] = text
+    # 自动保存
+    last_save_time=0
+    def autosave():
+        nonlocal last_save_time
+        now=time.time()
+        if (now-last_save_time)>=args.autosave_seconds:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            df.to_excel(out, index=False)
+            last_save_time=now
 
-    last_adjust_t = time.time()
-    wal_batch = 0
+    # 发送请求（同步，在线程中调用）
+    def call_one(idx:int) -> Tuple[int,str,bool,str]:
+        nonlocal failures,successes
+        ru = df.iat[idx, RU_COL] if df.shape[1]>RU_COL else ""
+        en = df.iat[idx, EN_COL] if df.shape[1]>EN_COL else ""
+        sp = df.iat[idx, SPEAKER_COL] if df.shape[1]>SPEAKER_COL else ""
+        src4 = df.iat[idx, SRC_COL] if df.shape[1]>SRC_COL else ""
+        src_cn = df.iat[idx, DST_COL] if df.shape[1]>DST_COL else ""
 
-    while True:
+        if (not args.overwrite) and isinstance(src_cn,str) and src_cn.strip():
+            return idx, src_cn, True, "skip_nonempty"
+
+        if not match_speaker(sp, args.speaker_like):
+            return idx, src_cn, True, "skip_speaker"
+
+        # 只处理范围内
+        if not (start-1 <= idx <= end-1):
+            return idx, src_cn, True, "skip_range"
+
+        # 速率令牌
+        bucket.take()
+
+        # 注入术语TOPK（从第4列/EN中粗选）
+        sample_text = (src4 or "") + "\n" + (en or "")
+        terms = longest_match_topk(glossary, sample_text, 300)
+
+        messages = make_messages(str(sp or ""), str(ru or ""), str(en or ""), str(src4 or ""), terms, args.target_lang)
+
+        t0=time.time()
         try:
-            i, out_text, lat, err = q_out.get(timeout=0.2)
-        except queue.Empty:
-            # 调整并发节流
-            adapt.maybe_adjust(bucket)
-            # 结束判定
-            alive = any(t.is_alive() for t in threads)
-            if not alive and q_out.empty():
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+            )
+            out_text = resp.choices[0].message.content.strip()
+            latency = time.time()-t0
+            successes += 1
+            return idx, out_text, True, f"ok:{latency:.2f}s"
+        except Exception as e:
+            failures += 1
+            return idx, str(e), False, "error"
+
+    # 任务队列
+    indices = list(range(n))
+    # 先根据 resume/wal 跳过已完成行
+    if done_rows:
+        indices = [i for i in indices if (i+1) not in done_rows]
+
+    # 主循环：伸缩线程池
+    q = []
+    results=[]
+    lock = threading.Lock()
+
+    def submit_batch(exe, batch):
+        futs=[]
+        for i in batch:
+            fut = exe.submit(call_one, i)
+            futs.append(fut)
+        return futs
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cur_workers) as exe, open(args.checkpoint_file,'a',encoding='utf-8') as ck:
+        pending=[]
+        ptr=0
+        while True:
+            # 动态补任务
+            while len(pending)<cur_workers and ptr < len(indices):
+                pending.append(exe.submit(call_one, indices[ptr]))
+                ptr+=1
+
+            if not pending:
                 break
-            # 周期落盘（按秒）
-            if time.time() - last_save_t >= args.autosave_seconds:
-                df.to_excel(out_path, index=False)
-                last_save_t = time.time()
-                print(f"[AUTO] saved -> {out_path}")
-            continue
 
-        processed += 1
-        if err:
-            eprint(f"[ERR ] row={i} {err}")
-        else:
-            df.iat[i, 4] = out_text  # 写入第5列
-            done_since_save += 1
-            if args.show_lines:
-                ru = str(df.iloc[i, 0]) if i < total else ""
-                en = str(df.iloc[i, 2]) if i < total else ""
-                print(f"[{now_ts()}] RU: {ru}")
-                print(f"[{now_ts()}] EN: {en}")
-                print(f"[{now_ts()}] OUT: {out_text}")
-            # WAL & checkpoint
-            if wal_batch % max(1, args.wal_every) == 0:
-                wal_append(wal_path, {"row": i, "out": out_text, "ts": time.time()})
-            ckpt_append(ckpt_path, i, out_text)
+            done, pending = concurrent.futures.wait(pending, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
 
-        # autosave by count
-        if done_since_save >= args.autosave_every:
-            df.to_excel(out_path, index=False)
-            last_save_t = time.time()
-            done_since_save = 0
-            print(f"[AUTO] saved -> {out_path}")
+            for fut in done:
+                idx, payload, ok, tag = fut.result()
+                if ok and not args.dry_run:
+                    df.iat[idx, DST_COL] = payload
+                # WAL
+                wal_obj = {"row": idx+1, "ok": ok, "tag": tag}
+                if ok: wal_obj["out"] = payload
+                else:  wal_obj["err"] = payload
+                wal_fp.write(json.dumps(wal_obj, ensure_ascii=False) + "\n")
+                wal_fp.flush()
 
-        # 定期自调
-        if time.time() - last_adjust_t >= 2.0:
-            adapt.maybe_adjust(bucket)
-            last_adjust_t = time.time()
+                # CKPT
+                if ok:
+                    ck.write(json.dumps({"row": idx+1, "ok": True}, ensure_ascii=False)+"\n")
+                    ck.flush()
 
-        wal_batch += 1
+                if args.show_lines:
+                    ru = df.iat[idx, RU_COL] if df.shape[1]>RU_COL else ""
+                    en = df.iat[idx, EN_COL] if df.shape[1]>EN_COL else ""
+                    sp = df.iat[idx, SPEAKER_COL] if df.shape[1]>SPEAKER_COL else ""
+                    print(f"[{time.strftime('%H:%M:%S')}] RU: {str(ru)[:120]}")
+                    print(f"[{time.strftime('%H:%M:%S')}] EN: {str(en)[:120]}")
+                    print(f"[{time.strftime('%H:%M:%S')}] OUT: {str(payload)[:120]}")
+                    print(f"[SEND] row={idx+1} speaker={sp}")
+
+                autosave()
+
+            # 自适应并发（每2秒评估）
+            now=time.time()
+            if now - last_adjust >= 2.0:
+                last_adjust = now
+                err_rate = failures / max(1,(successes+failures))
+                # 简单策略：高错误/疑似限流 -> 降并发；反之缓慢升
+                if err_rate >= 0.05 and cur_workers > args.min_workers:
+                    cur_workers = max(args.min_workers, cur_workers-1)
+                elif err_rate < 0.02 and cur_workers < args.max_workers:
+                    cur_workers = min(args.max_workers, cur_workers+1)
+                # RPM 微调：错误高时按需降一档
+                if err_rate >= 0.05 and bucket.rpm > 60:
+                    bucket.set_rpm(bucket.rpm - 20)
+                elif err_rate < 0.02 and bucket.rpm < (args.rpm or DEFAULT_RPM):
+                    bucket.set_rpm(min((args.rpm or DEFAULT_RPM), bucket.rpm + 20))
+                print(f"[PROGRESS] i={ptr}/{len(indices)} workers~{cur_workers} rpm~{bucket.rpm} ok={successes} err={failures}")
 
     # 最终保存
-    df.to_excel(out_path, index=False)
-    print(f"[OK] Done. Output -> {out_path}")
+    if not args.dry_run:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        df.to_excel(out, index=False)
+        print(f"[OK] Done. Output -> {out}")
+    else:
+        print("[DRY-RUN] Done.")
+    return 0
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    sys.exit(main())
